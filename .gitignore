@@ -1,0 +1,10 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+pipeline_control.db
+data/
+checkpoints/
+logs/
+ultimo_status.json
