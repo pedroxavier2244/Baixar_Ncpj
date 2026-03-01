@@ -18,9 +18,14 @@ log = get_logger("step.index")
 
 
 def _view_has_rows(conn: psycopg.Connection) -> bool:
-    """Check if mv_cnpj_full already has data (needed to choose refresh mode)."""
+    """Return True if mv_cnpj_full is populated (safe to REFRESH CONCURRENTLY).
+
+    Queries pg_matviews instead of the MV itself because SELECTing from an
+    unpopulated MV (created WITH NO DATA) raises an error in PostgreSQL.
+    """
     row = conn.execute(
-        "SELECT EXISTS(SELECT 1 FROM cnpj.mv_cnpj_full LIMIT 1)"
+        "SELECT ispopulated FROM pg_matviews"
+        " WHERE schemaname = 'cnpj' AND matviewname = 'mv_cnpj_full'"
     ).fetchone()
     return bool(row and row[0])
 

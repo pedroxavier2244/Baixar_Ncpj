@@ -23,6 +23,11 @@ def _webdav_base() -> str:
     return f"{u.scheme}://{u.netloc}/public.php/webdav/"
 
 
+def _webdav_auth_candidates(token: str) -> list[tuple[str, str]]:
+    # Different Nextcloud setups accept either password=token or username=token.
+    return [("", token), (token, "")]
+
+
 def _is_wanted(name: str) -> bool:
     low = name.lower()
     return any(w.lower() in low for w in settings.wanted_files) and low.endswith(".zip")
@@ -57,6 +62,15 @@ def _download_file(client: httpx.Client, url: str, dest: Path) -> dict:
                         downloaded += len(chunk)
         else:
             r.raise_for_status()
+            if resume_pos > 0 and r.status_code != 206:
+                # Server ignored the Range header and returned the full file.
+                # Appending would corrupt the ZIP — discard the partial file.
+                log.warning(
+                    f"{dest.name}: server returned {r.status_code} instead of 206, "
+                    "restarting download from scratch"
+                )
+                tmp.unlink(missing_ok=True)
+                resume_pos = 0
             mode = "ab" if resume_pos else "wb"
             downloaded = resume_pos
             with open(tmp, mode) as f:
@@ -105,17 +119,33 @@ def run(job_id: str, run_key: str, checkpoint_dir: Path) -> StepResult:
         return StepResult.failed("no wanted ZIPs in manifest")
 
     results = []
-    with httpx.Client(auth=("", token), follow_redirects=True) as client:
-        for file_info in files:
-            name = file_info["name"]
-            url = base_url + name
-            dest = dest_dir / name
-            try:
-                res = _make_retry_download(client, url, dest)
-                results.append(res)
-            except Exception as exc:
-                log.error(f"failed to download {name} after retries: {exc}")
-                return StepResult.failed(f"download failed for {name}: {exc}")
+    last_error: str | None = None
+    for auth in _webdav_auth_candidates(token):
+        results = []
+        auth_failed = False
+        with httpx.Client(auth=auth, follow_redirects=True) as client:
+            for file_info in files:
+                name = file_info["name"]
+                rel_path = file_info.get("path") or name
+                url = base_url + rel_path
+                dest = dest_dir / name
+                try:
+                    res = _make_retry_download(client, url, dest)
+                    results.append(res)
+                except Exception as exc:
+                    status = getattr(getattr(exc, "response", None), "status_code", None)
+                    if status == 401:
+                        auth_failed = True
+                        last_error = str(exc)
+                        log.warning(f"auth mode failed with 401 while downloading {name}; trying fallback auth")
+                        break
+                    log.error(f"failed to download {name} after retries: {exc}")
+                    return StepResult.failed(f"download failed for {name}: {exc}")
+        if not auth_failed:
+            break
+
+    if not results:
+        return StepResult.failed(f"download authentication failed for all auth modes: {last_error}")
 
     # Write step artifact atomically
     artifact = checkpoint_dir / "download_manifest.json"

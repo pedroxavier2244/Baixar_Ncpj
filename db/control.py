@@ -62,6 +62,33 @@ def create_job(run_key: str, payload: dict | None = None) -> str:
     return job_id
 
 
+def requeue_job(run_key: str, payload: dict | None = None) -> str:
+    """
+    Reset an existing job for run_key back to PENDING so it can be re-processed.
+    Clears attempts, lease, error and all step records.
+    Returns the existing job_id.
+    """
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT job_id FROM job_queue WHERE run_key = ?", (run_key,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"no job found for run_key={run_key}")
+        job_id = row["job_id"]
+        conn.execute(
+            """
+            UPDATE job_queue
+            SET status = 'PENDING', attempts = 0, lease_until = NULL,
+                started_at = NULL, finished_at = NULL, last_error = NULL,
+                payload_json = ?
+            WHERE job_id = ?
+            """,
+            (json.dumps(payload or {}, ensure_ascii=False), job_id),
+        )
+        conn.execute("DELETE FROM job_steps WHERE job_id = ?", (job_id,))
+    return job_id
+
+
 def get_job_by_run_key(run_key: str) -> sqlite3.Row | None:
     with get_conn() as conn:
         return conn.execute(
