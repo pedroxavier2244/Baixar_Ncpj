@@ -14,7 +14,7 @@ from config import settings
 class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         payload = {
-            "ts": datetime.utcnow().isoformat(),
+            "ts": datetime.utcfromtimestamp(record.created).isoformat(),
             "level": record.levelname,
             "logger": record.name,
             "msg": record.getMessage(),
@@ -39,6 +39,7 @@ def get_logger(name: str, run_date: str | None = None) -> logging.Logger:
         return logger  # already configured
 
     logger.setLevel(logging.DEBUG)
+    logger.propagate = False
 
     # File handler — JSON, daily rotation, keep 30 days
     fh = TimedRotatingFileHandler(

@@ -60,7 +60,10 @@ def process_one_job() -> bool:
         stop_event.set()
         hb.join(timeout=5)
 
-    finish_job(job_id, success=success, error=error)
+    try:
+        finish_job(job_id, success=success, error=error)
+    except Exception as exc:
+        log.error(f"finish_job failed for {job_id}: {exc} — job may remain as RUNNING until lease expires")
     status = "SUCCESS" if success else "FAILED/DEAD"
     log.info(f"job {job_id} finished with {status}")
     return True
@@ -81,7 +84,8 @@ def main() -> None:
         processed = process_one_job()
         if not processed:
             log.info("no jobs available — exiting")
-        sys.exit(0)
+            sys.exit(1)   # exit 1 = no job found
+        sys.exit(0)       # exit 0 = job ran (success or fail logged separately)
 
     # Continuous loop
     while True:

@@ -20,7 +20,10 @@ STEPS: list[tuple[str, StepFn]] = []  # populated by register_steps()
 
 
 def register_steps() -> None:
-    """Import step modules and build STEPS list."""
+    """Import step modules and build STEPS list. Safe to call multiple times."""
+    global STEPS
+    if STEPS:
+        return
     from steps.download_step import run as download
     from steps.verify_step import run as verify
     from steps.extract_step import run as extract
@@ -29,7 +32,6 @@ def register_steps() -> None:
     from steps.index_step import run as index
     from steps.cleanup_step import run as cleanup
 
-    global STEPS
     STEPS = [
         ("download", download),
         ("verify", verify),
@@ -54,8 +56,6 @@ def run_pipeline(job_id: str, run_key: str, checkpoint_dir: Path,
         existing = get_step(job_id, step_name)
         if existing and existing["status"] == "SUCCESS" and not force:
             log.info(f"[{step_name}] already SUCCESS — skipping")
-            upsert_step(job_id, step_name, "SKIPPED",
-                        artifact_path=existing["artifact_path"])
             continue
 
         log.info(f"[{step_name}] starting")
