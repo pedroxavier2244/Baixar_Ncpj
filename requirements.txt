@@ -17,6 +17,7 @@ pyarrow>=15.0
 # API
 fastapi>=0.111
 uvicorn[standard]>=0.29
+# NOTE: gunicorn requires Linux/macOS. On Windows, use: uvicorn api.main:app --workers 4
 gunicorn>=22.0
 
 # Utils

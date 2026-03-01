@@ -1,9 +1,10 @@
 from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+_ENV_FILE = Path(__file__).parent / ".env"
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+    model_config = SettingsConfigDict(env_file=str(_ENV_FILE), env_file_encoding="utf-8")
 
     # PostgreSQL
     postgres_url: str = "postgresql://user:pass@localhost:5432/cnpj_db"
@@ -18,7 +19,7 @@ class Settings(BaseSettings):
 
     # Download source
     webdav_share_url: str = "https://arquivos.receitafederal.gov.br/index.php/s/YggdBLfdninEJX9"
-    webdav_token: str = "YggdBLfdninEJX9"
+    webdav_token: str = ""
     download_timeout: int = 300
     download_chunk_size: int = 1024 * 1024  # 1 MB
     max_download_retries: int = 5
