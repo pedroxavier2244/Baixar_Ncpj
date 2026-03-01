@@ -71,13 +71,22 @@ def get_job_by_run_key(run_key: str) -> sqlite3.Row | None:
 
 def acquire_job(lease_seconds: int = 3600) -> sqlite3.Row | None:
     """
-    Atomically acquire the next available job (PENDING or FAILED with attempts
-    remaining and expired/no lease). Returns the row or None.
+    Atomically acquire the next available job using BEGIN IMMEDIATE to prevent
+    race conditions when multiple workers are running.
+    Returns the acquired job row (pre-update snapshot) or None.
     """
     lease_until = (datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)).isoformat()
     now = _now()
 
-    with get_conn() as conn:
+    conn = sqlite3.connect(_db_path(), timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    try:
+        # BEGIN IMMEDIATE acquires a write lock before SELECT,
+        # preventing two workers from selecting the same job concurrently.
+        conn.execute("BEGIN IMMEDIATE")
+
         row = conn.execute(
             """
             SELECT * FROM job_queue
@@ -91,18 +100,27 @@ def acquire_job(lease_seconds: int = 3600) -> sqlite3.Row | None:
         ).fetchone()
 
         if row is None:
+            conn.rollback()
             return None
 
         conn.execute(
             """
             UPDATE job_queue
-            SET status = 'RUNNING', attempts = attempts + 1,
-                started_at = ?, lease_until = ?
+            SET status = 'RUNNING',
+                attempts = attempts + 1,
+                started_at = ?,
+                lease_until = ?
             WHERE job_id = ?
             """,
             (now, lease_until, row["job_id"]),
         )
-    return row
+        conn.commit()
+        return row
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def renew_lease(job_id: str, lease_seconds: int = 3600) -> None:
