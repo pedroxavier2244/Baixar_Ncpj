@@ -1,7 +1,7 @@
 """
 Transform step — normalize Receita Federal CSV files.
-- Encoding: latin-1 → utf-8
-- Separator: ';' → ','
+- Encoding: latin-1 -> utf-8
+- Separator: ';' -> ','
 - Columns: fixed positions per RF layout (no header in source files)
 - Output: clean CSVs with headers in data/{run_key}/transformed/
 """
@@ -28,7 +28,8 @@ TABLE_SCHEMAS: dict[str, dict] = {
             "qualificacao_responsavel", "capital_social", "porte",
             "ente_federativo_responsavel",
         ],
-        "filename_keyword": "Empresas",
+        "filename_aliases": ["Empresas", "EMPRECSV"],
+        "required_columns": ["cnpj_basico"],
     },
     "estabelecimentos": {
         "columns": [
@@ -41,7 +42,8 @@ TABLE_SCHEMAS: dict[str, dict] = {
             "ddd2", "telefone2", "ddd_fax", "fax",
             "correio_eletronico", "situacao_especial", "data_situacao_especial",
         ],
-        "filename_keyword": "Estabelecimentos",
+        "filename_aliases": ["Estabelecimentos", "ESTABELE"],
+        "required_columns": ["cnpj_basico", "cnpj_ordem", "cnpj_dv"],
     },
     "socios": {
         "columns": [
@@ -50,15 +52,43 @@ TABLE_SCHEMAS: dict[str, dict] = {
             "data_entrada_sociedade", "pais", "representante_legal",
             "nome_representante", "qualificacao_representante", "faixa_etaria",
         ],
-        "filename_keyword": "Socios",
+        "filename_aliases": ["Socios", "SOCIOCSV"],
     },
-    "cnaes":          {"columns": ["codigo", "descricao"], "filename_keyword": "Cnaes"},
-    "municipios":     {"columns": ["codigo", "descricao"], "filename_keyword": "Municipios"},
-    "naturezas":      {"columns": ["codigo", "descricao"], "filename_keyword": "Naturezas"},
-    "qualificacoes":  {"columns": ["codigo", "descricao"], "filename_keyword": "Qualificacoes"},
-    "motivos":        {"columns": ["codigo", "descricao"], "filename_keyword": "Motivos"},
-    "paises":         {"columns": ["codigo", "descricao"], "filename_keyword": "Paises"},
-    "portes":         {"columns": ["codigo", "descricao"], "filename_keyword": "Portes"},
+    "cnaes": {
+        "columns": ["codigo", "descricao"],
+        "filename_aliases": ["Cnaes", "CNAECSV"],
+        "required_columns": ["codigo"],
+    },
+    "municipios": {
+        "columns": ["codigo", "descricao"],
+        "filename_aliases": ["Municipios", "MUNCSV", "MUNICSV"],
+        "required_columns": ["codigo"],
+    },
+    "naturezas": {
+        "columns": ["codigo", "descricao"],
+        "filename_aliases": ["Naturezas", "NATJUCSV"],
+        "required_columns": ["codigo"],
+    },
+    "qualificacoes": {
+        "columns": ["codigo", "descricao"],
+        "filename_aliases": ["Qualificacoes", "QUALSCSV"],
+        "required_columns": ["codigo"],
+    },
+    "motivos": {
+        "columns": ["codigo", "descricao"],
+        "filename_aliases": ["Motivos", "MOTICSV"],
+        "required_columns": ["codigo"],
+    },
+    "paises": {
+        "columns": ["codigo", "descricao"],
+        "filename_aliases": ["Paises", "PAISCSV"],
+        "required_columns": ["codigo"],
+    },
+    "portes": {
+        "columns": ["codigo", "descricao"],
+        "filename_aliases": ["Portes", "PORTECSV"],
+        "required_columns": ["codigo"],
+    },
 }
 
 # Null-like values that should become empty string
@@ -70,20 +100,22 @@ def _clean(value: str) -> str:
     return "" if v in _NULL_VALUES else v
 
 
-def _find_csvs(csv_dir: Path, keyword: str) -> list[Path]:
-    """Find all files in csv_dir whose name contains keyword (case-insensitive)."""
+def _find_csvs(csv_dir: Path, aliases: list[str]) -> list[Path]:
+    """Find all files in csv_dir whose name matches any alias (case-insensitive)."""
+    normalized = [a.lower() for a in aliases]
     return sorted([
         p for p in csv_dir.iterdir()
-        if keyword.lower() in p.name.lower()
-        and p.suffix.upper() in (".CSV", "")
+        if any(alias in p.name.lower() for alias in normalized)
         and not p.name.endswith(".tmp")
     ])
 
 
 def _transform_table(csv_dir: Path, schema: dict, out_dir: Path) -> dict:
-    keyword = schema["filename_keyword"]
+    aliases = schema["filename_aliases"]
+    keyword = aliases[0]
     columns = schema["columns"]
-    sources = _find_csvs(csv_dir, keyword)
+    required_columns = schema.get("required_columns", [])
+    sources = _find_csvs(csv_dir, aliases)
 
     if not sources:
         log.warning(f"no CSV found for keyword '{keyword}' — table will be empty")
@@ -94,6 +126,9 @@ def _transform_table(csv_dir: Path, schema: dict, out_dir: Path) -> dict:
     tmp_path = out_path.with_suffix(".tmp")
 
     total = 0
+    skipped_empty = 0
+    skipped_invalid = 0
+    required_idx = [columns.index(c) for c in required_columns if c in columns]
     with open(tmp_path, "w", encoding="utf-8", newline="") as out_f:
         writer = csv.writer(out_f, delimiter=",", quoting=csv.QUOTE_MINIMAL)
         writer.writerow(columns)
@@ -105,13 +140,26 @@ def _transform_table(csv_dir: Path, schema: dict, out_dir: Path) -> dict:
                 for row in reader:
                     # Pad or trim to expected column count
                     padded = (row + [""] * len(columns))[: len(columns)]
-                    writer.writerow([_clean(v) for v in padded])
+                    cleaned = [_clean(v) for v in padded]
+                    if not any(cleaned):
+                        skipped_empty += 1
+                        continue
+                    if required_idx and any(cleaned[i] == "" for i in required_idx):
+                        skipped_invalid += 1
+                        continue
+                    writer.writerow(cleaned)
                     total += 1
 
     tmp_path.replace(out_path)
-    log.info(f"  {keyword}: {total:,} rows → {out_path.name}")
+    log.info(f"  {keyword}: {total:,} rows -> {out_path.name}")
+    if skipped_empty or skipped_invalid:
+        log.info(
+            f"  {keyword}: skipped empty={skipped_empty:,} invalid_required={skipped_invalid:,}"
+        )
     return {"keyword": keyword, "rows": total, "out": str(out_path),
-            "files": [str(s) for s in sources]}
+            "files": [str(s) for s in sources],
+            "skipped_empty": skipped_empty,
+            "skipped_invalid_required": skipped_invalid}
 
 
 def run(job_id: str, run_key: str, checkpoint_dir: Path) -> StepResult:

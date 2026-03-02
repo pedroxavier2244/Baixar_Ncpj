@@ -119,6 +119,7 @@ def _diff_merge(conn: psycopg.Connection,
     pk_join   = " AND ".join(f"t.{c} = s.{c}" for c in pk_cols)
     pk_sub_ts = " AND ".join(f"s.{c} = t.{c}" for c in pk_cols)  # subquery t→s
     pk_sub_st = " AND ".join(f"t.{c} = s.{c}" for c in pk_cols)  # subquery s→t
+    pk_present = " AND ".join(f"NULLIF(BTRIM(s.{c}::text), '') IS NOT NULL" for c in pk_cols)
 
     ins_cols = ", ".join(f'"{c}"' for c in data_cols)
     ins_vals = ", ".join(f"s.{c}" for c in data_cols)
@@ -136,7 +137,8 @@ def _diff_merge(conn: psycopg.Connection,
             INSERT INTO {pg_table} ({ins_cols}, run_key, created_at, updated_at)
             SELECT {ins_vals}, %(run_key)s, NOW(), NOW()
             FROM {staging_table} s
-            WHERE NOT EXISTS (
+            WHERE ({pk_present})
+              AND NOT EXISTS (
                 SELECT 1 FROM {pg_table} t WHERE {pk_sub_st}
             )
         """, params)
@@ -148,7 +150,8 @@ def _diff_merge(conn: psycopg.Connection,
             UPDATE {pg_table} t
             SET {set_clause}, run_key = %(run_key)s, updated_at = NOW()
             FROM {staging_table} s
-            WHERE {pk_join}
+            WHERE ({pk_present})
+              AND {pk_join}
               AND {t_tuple} IS DISTINCT FROM {s_tuple}
         """, params)
         updated = cur.rowcount

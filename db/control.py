@@ -154,7 +154,7 @@ def renew_lease(job_id: str, lease_seconds: int = 3600) -> None:
     lease_until = (datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)).isoformat()
     with get_conn() as conn:
         conn.execute(
-            "UPDATE job_queue SET lease_until = ? WHERE job_id = ?",
+            "UPDATE job_queue SET lease_until = ? WHERE job_id = ? AND status = 'RUNNING'",
             (lease_until, job_id),
         )
 
