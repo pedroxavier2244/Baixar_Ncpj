@@ -12,7 +12,10 @@ import psycopg
 
 from config import settings
 from logger import get_logger
+
 from steps.base import StepResult
+
+_V = settings.pg_serving_schema  # "cnpj_serving"
 
 log = get_logger("step.index")
 
@@ -25,7 +28,7 @@ def _view_has_rows(conn: psycopg.Connection) -> bool:
     """
     row = conn.execute(
         "SELECT ispopulated FROM pg_matviews"
-        " WHERE schemaname = 'cnpj' AND matviewname = 'mv_cnpj_full'"
+        f" WHERE schemaname = '{_V}' AND matviewname = 'mv_cnpj_full'"
     ).fetchone()
     return bool(row and row[0])
 
@@ -37,13 +40,13 @@ def run(job_id: str, run_key: str, checkpoint_dir: Path) -> StepResult:
 
             if has_data:
                 log.info("refreshing mv_cnpj_full CONCURRENTLY (non-blocking)...")
-                conn.execute("REFRESH MATERIALIZED VIEW CONCURRENTLY cnpj.mv_cnpj_full")
+                conn.execute(f"REFRESH MATERIALIZED VIEW CONCURRENTLY {_V}.mv_cnpj_full")
             else:
                 log.info("first-ever refresh of mv_cnpj_full (non-concurrent)...")
-                conn.execute("REFRESH MATERIALIZED VIEW cnpj.mv_cnpj_full")
+                conn.execute(f"REFRESH MATERIALIZED VIEW {_V}.mv_cnpj_full")
 
             log.info("refresh complete — counting rows...")
-            row = conn.execute("SELECT COUNT(*) FROM cnpj.mv_cnpj_full").fetchone()
+            row = conn.execute(f"SELECT COUNT(*) FROM {_V}.mv_cnpj_full").fetchone()
             count = row[0] if row else 0
             log.info(f"mv_cnpj_full has {count:,} rows")
 
