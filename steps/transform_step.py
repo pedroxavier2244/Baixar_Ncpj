@@ -61,7 +61,7 @@ TABLE_SCHEMAS: dict[str, dict] = {
     },
     "municipios": {
         "columns": ["codigo", "descricao"],
-        "filename_aliases": ["Municipios", "MUNCSV", "MUNICSV"],
+        "filename_aliases": ["Municipios", "MUNICCSV"],
         "required_columns": ["codigo"],
     },
     "naturezas": {
@@ -88,6 +88,15 @@ TABLE_SCHEMAS: dict[str, dict] = {
         "columns": ["codigo", "descricao"],
         "filename_aliases": ["Portes", "PORTECSV"],
         "required_columns": ["codigo"],
+    },
+    "simples": {
+        "columns": [
+            "cnpj_basico", "opcao_pelo_simples", "data_opcao_simples",
+            "data_exclusao_simples", "opcao_pelo_mei", "data_opcao_mei",
+            "data_exclusao_mei",
+        ],
+        "filename_aliases": ["Simples", "SIMPLES"],
+        "required_columns": ["cnpj_basico"],
     },
 }
 

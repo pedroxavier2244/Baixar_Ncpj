@@ -36,14 +36,17 @@ class Settings(BaseSettings):
     db_pool_min: int = 5
     db_pool_max: int = 20
 
-    # Postgres schema
-    pg_schema: str = "cnpj"
+    # Postgres schemas (banco corporativo compartilhado — nunca usar "public")
+    pg_schema: str = "cnpj"                  # dados finais tratados
+    pg_staging_schema: str = "cnpj_staging"  # staging UNLOGGED (COPY rápido)
+    pg_serving_schema: str = "cnpj_serving"  # materialized views para API
 
-    # Files to download (keywords in filename)
+    # Arquivos a baixar (palavras-chave no nome do arquivo)
+    # Portes removido: RF parou de publicar em 2025-12 (tabela mantida no schema por compatibilidade)
     wanted_files: list[str] = [
-        "Empresas", "Estabelecimentos", "Socios",
+        "Empresas", "Estabelecimentos", "Socios", "Simples",
         "Cnaes", "Municipios", "Naturezas",
-        "Qualificacoes", "Motivos", "Paises", "Portes",
+        "Qualificacoes", "Motivos", "Paises",
     ]
 
     def ensure_dirs(self) -> None:
