@@ -4,13 +4,15 @@ from fastapi import APIRouter, Request
 from psycopg.rows import dict_row
 
 from api.schemas import HealthResponse
+from config import settings
+
+_MV = f"{settings.pg_serving_schema}.mv_cnpj_full"
 
 router = APIRouter()
 
 
 @router.get("", response_model=HealthResponse)
 async def health(request: Request):
-    from config import settings
 
     last_run_key: str | None = None
     try:
@@ -23,7 +25,7 @@ async def health(request: Request):
     try:
         async with request.app.state.pool.connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
-                await cur.execute("SELECT COUNT(*) AS c FROM cnpj.mv_cnpj_full")
+                await cur.execute(f"SELECT COUNT(*) AS c FROM {_MV}")
                 row = await cur.fetchone()
                 mv_count = row["c"] if row else None
     except Exception:
