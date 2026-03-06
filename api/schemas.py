@@ -5,6 +5,8 @@ from pydantic import BaseModel
 class CNPJResponse(BaseModel):
     cnpj_completo: str
     cnpj_basico: str
+    cnpj_ordem: Optional[str] = None
+    cnpj_dv: Optional[str] = None
     razao_social: Optional[str] = None
     nome_fantasia: Optional[str] = None
     natureza_juridica: Optional[str] = None
@@ -49,6 +51,7 @@ class CNPJResponse(BaseModel):
     opcao_pelo_mei: Optional[str] = None        # "S" = MEI, "N" = não MEI
     data_opcao_mei: Optional[str] = None
     data_exclusao_mei: Optional[str] = None
+    updated_at: Optional[str] = None
     run_key: Optional[str] = None
 
 
