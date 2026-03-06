@@ -31,6 +31,24 @@ class CNPJResponse(BaseModel):
     telefone1: Optional[str] = None
     correio_eletronico: Optional[str] = None
     identificador_matriz_filial: Optional[str] = None
+    situacao_especial: Optional[str] = None
+    data_situacao_especial: Optional[str] = None
+    nm_cidade_exterior: Optional[str] = None
+    pais: Optional[str] = None
+    ddd2: Optional[str] = None
+    telefone2: Optional[str] = None
+    ddd_fax: Optional[str] = None
+    fax: Optional[str] = None
+    qualificacao_responsavel: Optional[str] = None
+    ente_federativo_responsavel: Optional[str] = None
+    data_situacao_cadastral: Optional[str] = None
+    # Simples Nacional / MEI
+    opcao_pelo_simples: Optional[str] = None    # "S" = optante, "N" = não optante
+    data_opcao_simples: Optional[str] = None
+    data_exclusao_simples: Optional[str] = None
+    opcao_pelo_mei: Optional[str] = None        # "S" = MEI, "N" = não MEI
+    data_opcao_mei: Optional[str] = None
+    data_exclusao_mei: Optional[str] = None
     run_key: Optional[str] = None
 
 
