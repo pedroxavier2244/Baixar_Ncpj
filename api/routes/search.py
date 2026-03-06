@@ -4,8 +4,11 @@ from fastapi import APIRouter, Request
 from psycopg.rows import dict_row
 
 from api.schemas import CNPJResponse
+from config import settings
 
 router = APIRouter()
+
+_MV = f"{settings.pg_serving_schema}.mv_cnpj_full"
 
 
 @router.get("", response_model=list[CNPJResponse])
@@ -40,7 +43,7 @@ async def search(
         params.append(situacao)
 
     where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
-    query = f"SELECT * FROM cnpj.mv_cnpj_full {where} LIMIT %s"
+    query = f"SELECT * FROM {_MV} {where} LIMIT %s"
     params.append(limit)
 
     async with request.app.state.pool.connection() as conn:

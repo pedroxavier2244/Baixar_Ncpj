@@ -2,14 +2,13 @@ from fastapi import APIRouter, HTTPException, Request
 from psycopg.rows import dict_row
 
 from api.schemas import CNPJResponse
+from config import settings
 
 router = APIRouter()
 
-_SELECT = """
-    SELECT * FROM cnpj.mv_cnpj_full
-    WHERE cnpj_completo = %s OR cnpj_basico = %s
-    LIMIT 1
-"""
+_MV = f"{settings.pg_serving_schema}.mv_cnpj_full"
+
+_SELECT = f"SELECT * FROM {_MV} WHERE cnpj_completo = %s OR cnpj_basico = %s LIMIT 1"
 
 
 @router.get("/{cnpj}", response_model=CNPJResponse)
