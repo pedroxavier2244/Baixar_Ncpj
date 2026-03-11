@@ -29,7 +29,7 @@ services:
       LOG_DIR: "/logs"
       STATUS_FILE: "/data/ultimo_status.json"
     ports:
-      - "127.0.0.1:8000:8000"    # expõe só para o nginx local, não para a internet
+      - "127.0.0.1:8001:8000"    # expõe só para o nginx local, não para a internet
     volumes:
       - etl_data:/data
       - etl_logs:/logs
