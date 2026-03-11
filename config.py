@@ -33,8 +33,25 @@ class Settings(BaseSettings):
     api_host: str = "0.0.0.0"
     api_port: int = 8000
     api_workers: int = 8
-    db_pool_min: int = 5
-    db_pool_max: int = 20
+    db_pool_min: int = 10
+    db_pool_max: int = 50
+    db_pool_timeout: float = 10.0   # segundos para desistir de esperar conexão do pool
+
+    # Cache
+    redis_url: str = "redis://localhost:6379/0"
+    cache_ttl: int = 86400          # 24h — lookup de CNPJ individual
+    search_cache_ttl: int = 300     # 5min — resultados de busca
+
+    # Rate limiting (requisições por minuto por IP)
+    rate_limit_cnpj: str = "60/minute"
+    rate_limit_search: str = "30/minute"
+
+    # Segurança — API Key enviada pelo CRM no header X-API-Key
+    # Deixe vazio para desabilitar (desenvolvimento)
+    api_key: str = ""
+
+    # Timeout de query no banco (ms) — evita query lenta travar o pool
+    db_query_timeout_ms: int = 8000
 
     # Postgres schemas (banco corporativo compartilhado — nunca usar "public")
     pg_schema: str = "cnpj"                  # dados finais tratados

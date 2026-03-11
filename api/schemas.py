@@ -55,11 +55,27 @@ class CNPJResponse(BaseModel):
     run_key: Optional[str] = None
 
 
+class SocioResponse(BaseModel):
+    """Sócio/administrador de uma empresa — exibido no card do CRM."""
+    cnpj_basico: str
+    identificador_socio: Optional[str] = None   # "1"=PJ, "2"=PF, "3"=Estrangeiro
+    nome_socio: Optional[str] = None
+    cnpj_cpf_socio: Optional[str] = None
+    qualificacao_socio: Optional[str] = None
+    data_entrada_sociedade: Optional[str] = None
+    pais: Optional[str] = None
+    nome_representante: Optional[str] = None
+    qualificacao_representante: Optional[str] = None
+    faixa_etaria: Optional[str] = None
+
+
 class HealthResponse(BaseModel):
     status: str
     version: str = "1.0.0"
     last_success_run_key: Optional[str] = None
     mv_row_count: Optional[int] = None
+    db_ok: bool = True
+    cache_ok: bool = True
 
 
 class RunRecord(BaseModel):
