@@ -205,6 +205,7 @@ def _copy_csv(conn: psycopg.Connection, table: str,
         with cur.copy(sql) as copy:
             with open(csv_path, "r", encoding="utf-8") as f:
                 while chunk := f.read(65536):
+                    chunk = chunk.replace('\x00', '')  # remove null bytes rejeitados pelo Postgres
                     copy.write(chunk)
                     rows += chunk.count("\n")
     return max(0, rows - 1)
@@ -267,7 +268,15 @@ def _build_new_table(
     log.info(f"  {new_table}: ~{count:,} rows loaded")
 
     # Índices criados APÓS a carga = drasticamente mais rápido
+    # Drop pelo nome antes de criar — o swap renomeia a tabela mas mantém o nome do índice,
+    # então tentativas seguintes encontrariam o índice "órfão" na tabela live.
     for idx_sql in index_sqls:
+        parts = idx_sql.split()
+        idx_name = parts[2]  # "CREATE INDEX idx_name ON ..."
+        schema, _ = new_table.rsplit(".", 1)
+        with conn.cursor() as cur:
+            cur.execute(f"DROP INDEX IF EXISTS {schema}.{idx_name}")
+        conn.commit()
         with conn.cursor() as cur:
             cur.execute(idx_sql)
         conn.commit()
