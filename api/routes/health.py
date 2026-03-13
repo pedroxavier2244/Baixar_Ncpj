@@ -56,10 +56,30 @@ async def health(request: Request):
     except Exception:
         pass
 
+    # Métricas de cache
+    cache_hits: int | None = None
+    cache_misses: int | None = None
+    hit_rate: float | None = None
+    try:
+        hits_raw   = await request.app.state.redis.get("stats:cache_hits")
+        misses_raw = await request.app.state.redis.get("stats:cache_misses")
+        if hits_raw is not None and misses_raw is not None:
+            hits   = int(hits_raw)
+            misses = int(misses_raw)
+            cache_hits   = hits
+            cache_misses = misses
+            total = hits + misses
+            hit_rate = round(hits / total, 3) if total > 0 else None
+    except Exception:
+        pass
+
     return HealthResponse(
         status="ok" if db_ok else "degraded",
         last_success_run_key=last_run_key,
         mv_row_count=mv_count,
         db_ok=db_ok,
         cache_ok=cache_ok,
+        cache_hits=cache_hits,
+        cache_misses=cache_misses,
+        hit_rate=hit_rate,
     )

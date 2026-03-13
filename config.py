@@ -39,12 +39,13 @@ class Settings(BaseSettings):
 
     # Cache
     redis_url: str = "redis://localhost:6379/0"
-    cache_ttl: int = 86400          # 24h — lookup de CNPJ individual
+    cache_ttl: int = 2592000        # 30 dias — lookup de CNPJ individual
+    cache_stale_ttl: int = 7776000  # 90 dias — fallback stale quando banco falha
     search_cache_ttl: int = 300     # 5min — resultados de busca
 
     # Rate limiting (requisições por minuto por IP)
-    rate_limit_cnpj: str = "60/minute"
-    rate_limit_search: str = "30/minute"
+    rate_limit_cnpj: str = "2000/minute"
+    rate_limit_search: str = "1000/minute"
 
     # Segurança — API Key enviada pelo CRM no header X-API-Key
     # Deixe vazio para desabilitar (desenvolvimento)

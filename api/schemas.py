@@ -81,6 +81,9 @@ class HealthResponse(BaseModel):
     mv_row_count: Optional[int] = None
     db_ok: bool = True
     cache_ok: bool = True
+    cache_hits: Optional[int] = None
+    cache_misses: Optional[int] = None
+    hit_rate: Optional[float] = None
 
 
 class RunRecord(BaseModel):

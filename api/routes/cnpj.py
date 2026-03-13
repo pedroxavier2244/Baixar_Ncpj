@@ -1,7 +1,7 @@
 import json
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from psycopg.rows import dict_row
 
 from api.limiter import limiter
@@ -25,17 +25,26 @@ async def _redis_get(redis, key: str) -> Optional[str]:
         return None
 
 
-async def _redis_set(redis, key: str, ttl: int, value: str) -> None:
-    """Grava no Redis com degradação graceful — se Redis cair, ignora."""
+async def _redis_set(redis, key: str, value: str) -> None:
+    """Grava chave primária (30d) e stale (90d) com degradação graceful."""
     try:
-        await redis.setex(key, ttl, value)
+        await redis.setex(key, settings.cache_ttl, value)
+        await redis.setex(f"stale:{key}", settings.cache_stale_ttl, value)
+    except Exception:
+        pass
+
+
+async def _redis_incr(redis, key: str) -> None:
+    """Incrementa contador no Redis com degradação graceful."""
+    try:
+        await redis.incr(key)
     except Exception:
         pass
 
 
 @router.get("/{cnpj}", response_model=CNPJResponse)
 @limiter.limit(settings.rate_limit_cnpj)
-async def get_cnpj(cnpj: str, request: Request):
+async def get_cnpj(cnpj: str, request: Request, response: Response):
     """
     Retorna dados completos de um CNPJ para exibição no card do CRM.
     Aceita CNPJ completo (14 dígitos) ou base (8 dígitos).
@@ -46,12 +55,14 @@ async def get_cnpj(cnpj: str, request: Request):
 
     cache_key = f"cnpj:{cnpj_clean}"
 
-    # 1. Cache Redis — responde em ~2ms sem tocar no banco
+    # 1. Cache hit — responde em ~2ms sem tocar no banco
     cached = await _redis_get(request.app.state.redis, cache_key)
     if cached:
+        await _redis_incr(request.app.state.redis, "stats:cache_hits")
         return CNPJResponse(**json.loads(cached))
 
     # 2. Cache miss — busca no banco com timeout de segurança
+    await _redis_incr(request.app.state.redis, "stats:cache_misses")
     try:
         async with request.app.state.pool.connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
@@ -59,20 +70,27 @@ async def get_cnpj(cnpj: str, request: Request):
                 await cur.execute(_SELECT, (cnpj_clean, cnpj_clean))
                 row = await cur.fetchone()
     except Exception as exc:
-        if "statement timeout" in str(exc).lower():
-            raise HTTPException(status_code=503, detail="Banco de dados sobrecarregado. Tente novamente.")
-        raise HTTPException(status_code=503, detail="Erro ao consultar banco de dados.")
+        # Banco indisponível — tenta servir dado stale do Redis
+        stale = await _redis_get(request.app.state.redis, f"stale:{cache_key}")
+        if stale:
+            response.headers["X-Cache"] = "STALE"
+            return CNPJResponse(**json.loads(stale))
+        detail = (
+            "Banco de dados sobrecarregado. Tente novamente."
+            if "statement timeout" in str(exc).lower()
+            else "Erro ao consultar banco de dados."
+        )
+        raise HTTPException(status_code=503, detail=detail)
 
     if not row:
         raise HTTPException(status_code=404, detail=f"CNPJ {cnpj_clean} não encontrado")
 
     result = CNPJResponse(**row)
 
-    # 3. Salva no cache por 24h
+    # 3. Salva no cache — chave primária (30d) + stale (90d)
     await _redis_set(
         request.app.state.redis,
         cache_key,
-        settings.cache_ttl,
         json.dumps(result.model_dump(), default=str),
     )
 
@@ -81,7 +99,7 @@ async def get_cnpj(cnpj: str, request: Request):
 
 @router.get("/{cnpj}/socios", response_model=list[SocioResponse])
 @limiter.limit(settings.rate_limit_cnpj)
-async def get_socios(cnpj: str, request: Request):
+async def get_socios(cnpj: str, request: Request, response: Response):
     """
     Retorna os sócios/administradores de uma empresa.
     Exibido no card do CRM na seção 'Quadro Societário'.
@@ -90,14 +108,15 @@ async def get_socios(cnpj: str, request: Request):
     if len(cnpj_clean) not in (8, 14):
         raise HTTPException(status_code=400, detail="CNPJ deve ter 8 (base) ou 14 dígitos")
 
-    # Para CNPJ completo, usa só a base (8 dígitos)
     cnpj_basico = cnpj_clean[:8]
     cache_key = f"socios:{cnpj_basico}"
 
     cached = await _redis_get(request.app.state.redis, cache_key)
     if cached:
+        await _redis_incr(request.app.state.redis, "stats:cache_hits")
         return [SocioResponse(**s) for s in json.loads(cached)]
 
+    await _redis_incr(request.app.state.redis, "stats:cache_misses")
     try:
         async with request.app.state.pool.connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
@@ -108,16 +127,22 @@ async def get_socios(cnpj: str, request: Request):
                 )
                 rows = await cur.fetchall()
     except Exception as exc:
-        if "statement timeout" in str(exc).lower():
-            raise HTTPException(status_code=503, detail="Banco de dados sobrecarregado. Tente novamente.")
-        raise HTTPException(status_code=503, detail="Erro ao consultar banco de dados.")
+        stale = await _redis_get(request.app.state.redis, f"stale:{cache_key}")
+        if stale:
+            response.headers["X-Cache"] = "STALE"
+            return [SocioResponse(**s) for s in json.loads(stale)]
+        detail = (
+            "Banco de dados sobrecarregado. Tente novamente."
+            if "statement timeout" in str(exc).lower()
+            else "Erro ao consultar banco de dados."
+        )
+        raise HTTPException(status_code=503, detail=detail)
 
     result = [SocioResponse(**r) for r in rows]
 
     await _redis_set(
         request.app.state.redis,
         cache_key,
-        settings.cache_ttl,
         json.dumps([s.model_dump() for s in result], default=str),
     )
 
