@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Optional
 from pydantic import BaseModel
 
@@ -51,7 +52,7 @@ class CNPJResponse(BaseModel):
     opcao_pelo_mei: Optional[str] = None        # "S" = MEI, "N" = não MEI
     data_opcao_mei: Optional[str] = None
     data_exclusao_mei: Optional[str] = None
-    updated_at: Optional[str] = None
+    updated_at: Optional[datetime] = None
     run_key: Optional[str] = None
 
 
