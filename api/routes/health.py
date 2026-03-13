@@ -63,9 +63,9 @@ async def health(request: Request):
     try:
         hits_raw   = await request.app.state.redis.get("stats:cache_hits")
         misses_raw = await request.app.state.redis.get("stats:cache_misses")
-        if hits_raw is not None and misses_raw is not None:
-            hits   = int(hits_raw)
-            misses = int(misses_raw)
+        if hits_raw is not None or misses_raw is not None:
+            hits   = int(hits_raw)   if hits_raw   else 0
+            misses = int(misses_raw) if misses_raw else 0
             cache_hits   = hits
             cache_misses = misses
             total = hits + misses
