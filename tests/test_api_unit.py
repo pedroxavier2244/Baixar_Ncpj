@@ -5,7 +5,7 @@ Usa TestClient com mocks de pool (psycopg) e Redis.
 Não requer banco de dados nem Redis rodando.
 """
 import json
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, call, patch
 
 import pytest
 from starlette.testclient import TestClient
@@ -145,6 +145,82 @@ class TestSearchEndpoint:
         r = client.get("/search?razao_social=EMPRESA_INEXISTENTE_XYZXYZ")
         assert r.status_code == 200
         assert r.json() == []
+
+    def test_search_retorna_socios_em_cada_empresa(self, client, mock_cursor):
+        """Cada empresa no resultado deve ter o campo socios com os sócios."""
+        from tests.conftest import _SAMPLE_SOCIO
+        mock_cursor.fetchall = AsyncMock(side_effect=[
+            [{"cnpj_completo": "11111111000141", "cnpj_basico": "11111111",
+              "cnpj_ordem": "0001", "cnpj_dv": "41",
+              "razao_social": "EMPRESA ALPHA LTDA", "nome_fantasia": "ALPHA STORE",
+              "uf": "SP", "situacao_cadastral": "02",
+              "run_key": "2026-01", "updated_at": "2026-01-01T00:00:00+00:00"}],
+            [_SAMPLE_SOCIO],
+        ])
+        r = client.get("/search?uf=SP")
+        assert r.status_code == 200
+        data = r.json()
+        assert len(data) == 1
+        assert "socios" in data[0]
+        assert len(data[0]["socios"]) == 1
+        assert data[0]["socios"][0]["nome_socio"] == "JOAO DA SILVA"
+
+    def test_search_empresa_sem_socios_retorna_lista_vazia(self, client, mock_cursor):
+        """Empresa sem sócios cadastrados deve receber socios: []."""
+        mock_cursor.fetchall = AsyncMock(side_effect=[
+            [{"cnpj_completo": "22222222000100", "cnpj_basico": "22222222",
+              "cnpj_ordem": "0001", "cnpj_dv": "00",
+              "razao_social": "EMPRESA SEM SOCIOS LTDA", "nome_fantasia": None,
+              "uf": "RJ", "situacao_cadastral": "02",
+              "run_key": "2026-01", "updated_at": "2026-01-01T00:00:00+00:00"}],
+            [],  # nenhum sócio
+        ])
+        r = client.get("/search?uf=RJ")
+        assert r.status_code == 200
+        data = r.json()
+        assert data[0]["socios"] == []
+
+    def test_search_cache_usa_prefixo_v2(self, client, mock_redis, mock_cursor):
+        """Cache do search deve usar chave com prefixo search_v2:."""
+        from tests.conftest import _SAMPLE_SOCIO
+        mock_cursor.fetchall = AsyncMock(side_effect=[
+            [{"cnpj_completo": "11111111000141", "cnpj_basico": "11111111",
+              "cnpj_ordem": "0001", "cnpj_dv": "41",
+              "razao_social": "EMPRESA ALPHA LTDA", "nome_fantasia": "ALPHA STORE",
+              "uf": "SP", "situacao_cadastral": "02",
+              "run_key": "2026-01", "updated_at": "2026-01-01T00:00:00+00:00"}],
+            [_SAMPLE_SOCIO],
+        ])
+        r = client.get("/search?uf=SP")
+        assert r.status_code == 200
+        mock_redis.setex.assert_called_once()
+        cache_key = mock_redis.setex.call_args[0][0]
+        assert cache_key.startswith("search_v2:")
+
+    def test_search_cache_hit_retorna_socios(self, mock_pool, mock_redis):
+        """Cache hit deve retornar CNPJWithSociosResponse com socios."""
+        cached_data = [{"cnpj_completo": "11111111000141", "cnpj_basico": "11111111",
+                        "cnpj_ordem": "0001", "cnpj_dv": "41",
+                        "razao_social": "EMPRESA ALPHA LTDA", "nome_fantasia": "ALPHA STORE",
+                        "uf": "SP", "situacao_cadastral": "02",
+                        "run_key": "2026-01", "updated_at": "2026-01-01T00:00:00+00:00",
+                        "socios": [{"cnpj_basico": "11111111", "nome_socio": "JOAO DA SILVA",
+                                    "identificador_socio": "2", "cnpj_cpf_socio": "***123456**",
+                                    "qualificacao_socio": "49", "data_entrada_sociedade": "20200101",
+                                    "pais": None, "nome_representante": None,
+                                    "qualificacao_representante": "00", "faixa_etaria": "4"}]}]
+        mock_redis.get = AsyncMock(return_value=json.dumps(cached_data, default=str))
+        with patch("api.main.psycopg_pool.AsyncConnectionPool", return_value=mock_pool), \
+             patch("api.main.aioredis.from_url", return_value=mock_redis):
+            from starlette.testclient import TestClient
+            from api.main import app
+            with TestClient(app) as c:
+                r = c.get("/search?uf=SP")
+        assert r.status_code == 200
+        data = r.json()
+        assert "socios" in data[0]
+        assert data[0]["socios"][0]["nome_socio"] == "JOAO DA SILVA"
+        mock_pool.connection.assert_not_called()
 
 
 # ── GET /health ───────────────────────────────────────────────────────────────

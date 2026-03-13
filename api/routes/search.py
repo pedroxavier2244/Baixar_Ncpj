@@ -1,18 +1,20 @@
 import hashlib
 import json
+from collections import defaultdict
 from typing import Literal, Optional
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from psycopg.rows import dict_row
 
 from api.limiter import limiter
-from api.schemas import CNPJResponse
+from api.schemas import CNPJWithSociosResponse, SocioResponse
 from api.security import verify_api_key
 from config import settings
 
 router = APIRouter(dependencies=[Depends(verify_api_key)])
 
 _MV      = f"{settings.pg_serving_schema}.mv_cnpj_full"
+_SOCIOS  = f"{settings.pg_schema}.rf_socios"
 _TIMEOUT = f"SET LOCAL statement_timeout = {settings.db_query_timeout_ms}"
 
 _ALLOWED_ORDER = {
@@ -20,7 +22,7 @@ _ALLOWED_ORDER = {
 }
 
 
-@router.get("", response_model=list[CNPJResponse])
+@router.get("", response_model=list[CNPJWithSociosResponse])
 @limiter.limit(settings.rate_limit_search)
 async def search(
     request: Request,
@@ -40,6 +42,7 @@ async def search(
 ):
     """
     Busca empresas para o CRM com filtros avançados e paginação.
+    Inclui quadro societário de cada empresa no resultado.
     Resultados são cacheados por 5 minutos (mesmo filtro = mesma resposta).
     """
     limit  = min(max(1, limit), 100)
@@ -81,8 +84,8 @@ async def search(
     query = f"SELECT * FROM {_MV} {where} {order} LIMIT %s OFFSET %s"
     params.extend([limit, offset])
 
-    # Cache key baseada em todos os parâmetros da query
-    cache_key = "search:" + hashlib.md5(
+    # Cache key baseada em todos os parâmetros da query — v2 inclui sócios
+    cache_key = "search_v2:" + hashlib.md5(
         json.dumps({"q": query, "p": params}, default=str).encode()
     ).hexdigest()
 
@@ -90,17 +93,47 @@ async def search(
     try:
         cached = await request.app.state.redis.get(cache_key)
         if cached:
-            return [CNPJResponse(**r) for r in json.loads(cached)]
+            return [CNPJWithSociosResponse(**r) for r in json.loads(cached)]
     except Exception:
         pass
 
-    async with request.app.state.pool.connection() as conn:
-        async with conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute(_TIMEOUT)
-            await cur.execute(query, params)
-            rows = await cur.fetchall()
+    try:
+        async with request.app.state.pool.connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(_TIMEOUT)
+                await cur.execute(query, params)
+                rows = await cur.fetchall()
 
-    result = [CNPJResponse(**r) for r in rows]
+                if not rows:
+                    return []
+
+                # Batch query de sócios — uma única query para todos os resultados
+                cnpj_basicos = list({r["cnpj_basico"] for r in rows})
+                placeholders = ", ".join("%s" for _ in cnpj_basicos)
+                await cur.execute(
+                    f"SELECT * FROM {_SOCIOS} "
+                    f"WHERE cnpj_basico IN ({placeholders}) "
+                    f"ORDER BY cnpj_basico, nome_socio",
+                    cnpj_basicos,
+                )
+                socios_rows = await cur.fetchall()
+    except Exception as exc:
+        if "statement timeout" in str(exc).lower():
+            raise HTTPException(status_code=503, detail="Banco de dados sobrecarregado. Tente novamente.")
+        raise HTTPException(status_code=503, detail="Erro ao consultar banco de dados.")
+
+    # Agrupa sócios por cnpj_basico
+    socios_by_cnpj: dict[str, list] = defaultdict(list)
+    for s in socios_rows:
+        socios_by_cnpj[s["cnpj_basico"].strip()].append(SocioResponse(**s))
+
+    result = [
+        CNPJWithSociosResponse(
+            **r,
+            socios=socios_by_cnpj.get(r["cnpj_basico"].strip(), []),
+        )
+        for r in rows
+    ]
 
     try:
         await request.app.state.redis.setex(

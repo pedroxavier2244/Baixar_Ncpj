@@ -1,7 +1,8 @@
 """
-conftest.py — shared fixtures for load/index step tests.
+conftest.py — shared fixtures for load/index step tests and API unit tests.
 
 Provides:
+- mock_cursor, mock_pool, mock_redis: async mocks for API unit tests
 - sample_csvs: minimal UTF-8 CSV files matching the actual column schemas
 - transform_manifest: writes transform_manifest.json to a temp checkpoint dir
 - pg_conn: raw psycopg connection to a test PostgreSQL instance
@@ -12,9 +13,81 @@ from __future__ import annotations
 import json
 import os
 import time
+from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import AsyncMock
+
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+
+# ── API unit test mock fixtures ──────────────────────────────────────────────
+
+_SAMPLE_EMPRESA = {
+    "cnpj_completo": "11111111000141",
+    "cnpj_basico": "11111111",
+    "cnpj_ordem": "0001",
+    "cnpj_dv": "41",
+    "razao_social": "EMPRESA ALPHA LTDA",
+    "nome_fantasia": "ALPHA STORE",
+    "uf": "SP",
+    "situacao_cadastral": "02",
+    "run_key": "2026-01",
+    "updated_at": datetime(2026, 1, 1, tzinfo=timezone.utc),
+}
+
+_SAMPLE_SOCIO = {
+    "cnpj_basico": "11111111",
+    "identificador_socio": "2",
+    "nome_socio": "JOAO DA SILVA",
+    "cnpj_cpf_socio": "***123456**",
+    "qualificacao_socio": "49",
+    "data_entrada_sociedade": "20200101",
+    "pais": None,
+    "nome_representante": None,
+    "qualificacao_representante": "00",
+    "faixa_etaria": "4",
+}
+
+
+@pytest.fixture
+def mock_cursor():
+    cursor = AsyncMock()
+    cursor.fetchone = AsyncMock(return_value=_SAMPLE_EMPRESA)
+    cursor.fetchall = AsyncMock(return_value=[_SAMPLE_EMPRESA])
+    return cursor
+
+
+@pytest.fixture
+def mock_pool(mock_cursor):
+    cursor_cm = AsyncMock()
+    cursor_cm.__aenter__ = AsyncMock(return_value=mock_cursor)
+    cursor_cm.__aexit__ = AsyncMock(return_value=False)
+
+    conn = MagicMock()
+    conn.cursor = MagicMock(return_value=cursor_cm)
+
+    conn_cm = AsyncMock()
+    conn_cm.__aenter__ = AsyncMock(return_value=conn)
+    conn_cm.__aexit__ = AsyncMock(return_value=False)
+
+    pool = MagicMock()
+    pool.connection = MagicMock(return_value=conn_cm)
+    pool.open = AsyncMock()
+    pool.close = AsyncMock()
+    return pool
+
+
+@pytest.fixture
+def mock_redis():
+    redis = AsyncMock()
+    redis.get = AsyncMock(return_value=None)
+    redis.setex = AsyncMock(return_value=True)
+    redis.ping = AsyncMock(return_value=True)
+    redis.flushdb = AsyncMock(return_value=True)
+    redis.aclose = AsyncMock()
+    return redis
+
 
 # ── CSV content constants ────────────────────────────────────────────────────
 

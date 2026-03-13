@@ -70,6 +70,10 @@ class SocioResponse(BaseModel):
     faixa_etaria: Optional[str] = None
 
 
+class CNPJWithSociosResponse(CNPJResponse):
+    socios: list[SocioResponse] = []
+
+
 class HealthResponse(BaseModel):
     status: str
     version: str = "1.0.0"
