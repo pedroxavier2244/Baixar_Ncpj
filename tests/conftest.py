@@ -49,6 +49,19 @@ _SAMPLE_SOCIO = {
     "faixa_etaria": "4",
 }
 
+_SAMPLE_PJ_SOCIO = {
+    "cnpj_basico": "11111111",
+    "identificador_socio": "1",          # 1 = PJ
+    "nome_socio": "EMPRESA BETA LTDA",
+    "cnpj_cpf_socio": "22222222000100",  # CNPJ da empresa sócia
+    "qualificacao_socio": "05",
+    "data_entrada_sociedade": "20210101",
+    "pais": None,
+    "nome_representante": None,
+    "qualificacao_representante": "00",
+    "faixa_etaria": None,
+}
+
 
 @pytest.fixture
 def mock_cursor():

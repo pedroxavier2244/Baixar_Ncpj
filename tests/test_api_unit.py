@@ -79,9 +79,10 @@ class TestCnpjEndpoint:
         """Quando não está em cache, deve salvar no Redis após buscar no banco."""
         r = client.get("/cnpj/11111111000141")
         assert r.status_code == 200
-        mock_redis.setex.assert_called_once()
-        args = mock_redis.setex.call_args[0]
-        assert "cnpj:11111111000141" in args[0]
+        mock_redis.setex.assert_called()
+        # _redis_set chama setex duas vezes: chave primária + stale
+        first_key = mock_redis.setex.call_args_list[0][0][0]
+        assert "cnpj:11111111000141" in first_key
 
     def test_cache_hit_nao_acessa_banco(self, client_cache_hit):
         client, mock_redis, mock_pool = client_cache_hit
@@ -265,3 +266,98 @@ class TestRateLimiting:
                 # Ao menos 60 devem ter passado
                 ok_count = sum(1 for r in responses if r.status_code == 200)
                 assert ok_count >= 1
+
+
+# ── GET /cnpj/{cnpj}/participacoes ────────────────────────────────────────────
+
+class TestParticipacoesEndpoint:
+    def test_participacoes_retorna_lista_de_empresas(self, client, mock_cursor):
+        """CNPJ válido com participações retorna lista de CNPJWithSociosResponse."""
+        from tests.conftest import _SAMPLE_EMPRESA, _SAMPLE_PJ_SOCIO
+        mock_cursor.fetchall = AsyncMock(side_effect=[
+            [_SAMPLE_EMPRESA],   # empresas onde aparece como sócio
+            [_SAMPLE_PJ_SOCIO],  # sócios dessas empresas
+        ])
+        r = client.get("/cnpj/22222222000100/participacoes")
+        assert r.status_code == 200
+        data = r.json()
+        assert isinstance(data, list)
+        assert len(data) == 1
+        assert data[0]["cnpj_completo"] == "11111111000141"
+
+    def test_participacoes_sem_resultado_retorna_lista_vazia(self, client, mock_cursor):
+        """CNPJ sem participações retorna [] (não 404)."""
+        mock_cursor.fetchall = AsyncMock(return_value=[])
+        r = client.get("/cnpj/99999999000199/participacoes")
+        assert r.status_code == 200
+        assert r.json() == []
+
+    def test_participacoes_cnpj_invalido_retorna_400(self, client):
+        """CNPJ com menos de 14 dígitos retorna 400."""
+        r = client.get("/cnpj/1234/participacoes")
+        assert r.status_code == 400
+        assert "14" in r.json()["detail"]
+
+    def test_participacoes_cnpj_8_digitos_retorna_400(self, client):
+        """CNPJ base (8 dígitos) não é válido para participações — exige 14."""
+        r = client.get("/cnpj/22222222/participacoes")
+        assert r.status_code == 400
+
+    def test_participacoes_cnpj_formatado_aceito(self, client, mock_cursor):
+        """CNPJ com pontos e traço deve ser aceito após strip de não-dígitos."""
+        mock_cursor.fetchall = AsyncMock(return_value=[])
+        r = client.get("/cnpj/22.222.222000100/participacoes")
+        # 22.222.222000100 → 22222222000100 = 14 dígitos → aceito
+        assert r.status_code == 200
+        assert r.json() == []
+
+    def test_participacoes_cache_miss_salva_no_redis(self, client, mock_redis, mock_cursor):
+        """Cache miss deve salvar resultado no Redis."""
+        from tests.conftest import _SAMPLE_EMPRESA, _SAMPLE_PJ_SOCIO
+        mock_cursor.fetchall = AsyncMock(side_effect=[
+            [_SAMPLE_EMPRESA],
+            [_SAMPLE_PJ_SOCIO],
+        ])
+        r = client.get("/cnpj/22222222000100/participacoes")
+        assert r.status_code == 200
+        mock_redis.setex.assert_called()
+        # Verifica que a chave de cache usa prefixo correto
+        first_call_key = mock_redis.setex.call_args_list[0][0][0]
+        assert "participacoes:22222222000100" in first_call_key
+
+    def test_participacoes_cache_hit_nao_acessa_banco(self, mock_pool, mock_redis):
+        """Cache hit deve retornar dados sem acessar o banco."""
+        cached = [{"cnpj_completo": "11111111000141", "cnpj_basico": "11111111",
+                   "cnpj_ordem": "0001", "cnpj_dv": "41",
+                   "razao_social": "EMPRESA ALPHA LTDA", "nome_fantasia": "ALPHA STORE",
+                   "uf": "SP", "situacao_cadastral": "02",
+                   "run_key": "2026-01", "updated_at": "2026-01-01T00:00:00+00:00",
+                   "socios": []}]
+        mock_redis.get = AsyncMock(return_value=json.dumps(cached, default=str))
+        with patch("api.main.psycopg_pool.AsyncConnectionPool", return_value=mock_pool), \
+             patch("api.main.aioredis.from_url", return_value=mock_redis):
+            with TestClient(app) as c:
+                r = c.get("/cnpj/22222222000100/participacoes")
+        assert r.status_code == 200
+        assert r.json()[0]["cnpj_completo"] == "11111111000141"
+        mock_pool.connection.assert_not_called()
+
+    def test_participacoes_retorna_socios_de_cada_empresa(self, client, mock_cursor):
+        """Cada empresa retornada deve ter seu quadro societário preenchido."""
+        from tests.conftest import _SAMPLE_EMPRESA, _SAMPLE_PJ_SOCIO
+        mock_cursor.fetchall = AsyncMock(side_effect=[
+            [_SAMPLE_EMPRESA],
+            [_SAMPLE_PJ_SOCIO],
+        ])
+        r = client.get("/cnpj/22222222000100/participacoes")
+        assert r.status_code == 200
+        data = r.json()
+        assert "socios" in data[0]
+        assert len(data[0]["socios"]) == 1
+        assert data[0]["socios"][0]["nome_socio"] == "EMPRESA BETA LTDA"
+
+    def test_participacoes_banco_indisponivel_retorna_503(self, client, mock_pool):
+        """Banco indisponível sem stale → 503."""
+        mock_pool.connection.side_effect = Exception("DB down")
+        r = client.get("/cnpj/22222222000100/participacoes")
+        assert r.status_code == 503
