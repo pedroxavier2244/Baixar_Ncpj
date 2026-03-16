@@ -361,3 +361,149 @@ class TestParticipacoesEndpoint:
         mock_pool.connection.side_effect = Exception("DB down")
         r = client.get("/cnpj/22222222000100/participacoes")
         assert r.status_code == 503
+
+
+# ── GET /socios/buscar ────────────────────────────────────────────────────────
+
+class TestSociosBuscarEndpoint:
+    def test_buscar_retorna_empresas_da_pessoa(self, client, mock_cursor):
+        """digitos + nome válidos retornam lista de CNPJWithSociosResponse."""
+        from tests.conftest import _SAMPLE_EMPRESA, _SAMPLE_SOCIO
+        mock_cursor.fetchall = AsyncMock(side_effect=[
+            [_SAMPLE_EMPRESA],
+            [_SAMPLE_SOCIO],
+        ])
+        r = client.get("/socios/buscar?digitos=123456&nome=JOAO+DA+SILVA")
+        assert r.status_code == 200
+        data = r.json()
+        assert isinstance(data, list)
+        assert len(data) == 1
+        assert data[0]["cnpj_completo"] == "11111111000141"
+
+    def test_buscar_sem_resultado_retorna_lista_vazia(self, client, mock_cursor):
+        """Combinação sem match retorna [] (não 404)."""
+        mock_cursor.fetchall = AsyncMock(return_value=[])
+        r = client.get("/socios/buscar?digitos=999999&nome=PESSOA+INEXISTENTE")
+        assert r.status_code == 200
+        assert r.json() == []
+
+    def test_buscar_digitos_faltando_retorna_422(self, client):
+        """Parâmetro digitos ausente retorna 422 (campo obrigatório)."""
+        r = client.get("/socios/buscar?nome=JOAO+DA+SILVA")
+        assert r.status_code == 422
+
+    def test_buscar_nome_faltando_retorna_422(self, client):
+        """Parâmetro nome ausente retorna 422 (campo obrigatório)."""
+        r = client.get("/socios/buscar?digitos=123456")
+        assert r.status_code == 422
+
+    def test_buscar_digitos_nao_numericos_retorna_400(self, client):
+        """digitos com letras retorna 400."""
+        r = client.get("/socios/buscar?digitos=ABCDEF&nome=JOAO+DA+SILVA")
+        assert r.status_code == 400
+        assert "dígitos" in r.json()["detail"].lower()
+
+    def test_buscar_digitos_quantidade_errada_retorna_400(self, client):
+        """digitos com quantidade diferente de 6 retorna 400."""
+        r = client.get("/socios/buscar?digitos=123&nome=JOAO+DA+SILVA")
+        assert r.status_code == 400
+
+    def test_buscar_nome_vazio_retorna_400(self, client):
+        """nome vazio retorna 400."""
+        r = client.get("/socios/buscar?digitos=123456&nome=")
+        assert r.status_code == 400
+
+    def test_buscar_nome_em_minusculo_normalizado(self, client, mock_cursor):
+        """nome em minúsculas deve ser normalizado para uppercase antes da query."""
+        from tests.conftest import _SAMPLE_EMPRESA, _SAMPLE_SOCIO
+        mock_cursor.fetchall = AsyncMock(side_effect=[
+            [_SAMPLE_EMPRESA],
+            [_SAMPLE_SOCIO],
+        ])
+        r = client.get("/socios/buscar?digitos=123456&nome=joao+da+silva")
+        assert r.status_code == 200
+        execute_calls = mock_cursor.execute.call_args_list
+        query_call = next(c for c in execute_calls if "identificador_socio" in str(c))
+        assert "JOAO DA SILVA" in str(query_call)
+
+    def test_buscar_cache_miss_salva_primary_e_stale_no_redis(self, client, mock_redis, mock_cursor):
+        """Cache miss deve salvar chave primária E stale no Redis (dual-TTL)."""
+        from tests.conftest import _SAMPLE_EMPRESA, _SAMPLE_SOCIO
+        mock_cursor.fetchall = AsyncMock(side_effect=[
+            [_SAMPLE_EMPRESA],
+            [_SAMPLE_SOCIO],
+        ])
+        r = client.get("/socios/buscar?digitos=123456&nome=JOAO+DA+SILVA")
+        assert r.status_code == 200
+        assert mock_redis.setex.call_count == 2
+        keys = [c[0][0] for c in mock_redis.setex.call_args_list]
+        assert any("socios_busca:" in k and not k.startswith("stale:") for k in keys)
+        assert any(k.startswith("stale:socios_busca:") for k in keys)
+
+    def test_buscar_cache_hit_nao_acessa_banco(self, mock_pool, mock_redis):
+        """Cache hit deve retornar dados sem acessar o banco."""
+        cached = [{"cnpj_completo": "11111111000141", "cnpj_basico": "11111111",
+                   "cnpj_ordem": "0001", "cnpj_dv": "41",
+                   "razao_social": "EMPRESA ALPHA LTDA", "nome_fantasia": "ALPHA STORE",
+                   "uf": "SP", "situacao_cadastral": "02",
+                   "run_key": "2026-01", "updated_at": "2026-01-01T00:00:00+00:00",
+                   "socios": []}]
+        mock_redis.get = AsyncMock(return_value=json.dumps(cached, default=str))
+        with patch("api.main.psycopg_pool.AsyncConnectionPool", return_value=mock_pool), \
+             patch("api.main.aioredis.from_url", return_value=mock_redis):
+            with TestClient(app) as c:
+                r = c.get("/socios/buscar?digitos=123456&nome=JOAO+DA+SILVA")
+        assert r.status_code == 200
+        assert r.json()[0]["cnpj_completo"] == "11111111000141"
+        mock_pool.connection.assert_not_called()
+
+    def test_buscar_retorna_socios_de_cada_empresa(self, client, mock_cursor):
+        """Cada empresa retornada deve ter seu quadro societário preenchido."""
+        from tests.conftest import _SAMPLE_EMPRESA, _SAMPLE_SOCIO
+        mock_cursor.fetchall = AsyncMock(side_effect=[
+            [_SAMPLE_EMPRESA],
+            [_SAMPLE_SOCIO],
+        ])
+        r = client.get("/socios/buscar?digitos=123456&nome=JOAO+DA+SILVA")
+        assert r.status_code == 200
+        data = r.json()
+        assert "socios" in data[0]
+        assert data[0]["socios"][0]["nome_socio"] == "JOAO DA SILVA"
+
+    def test_buscar_banco_indisponivel_sem_stale_retorna_503(self, client, mock_pool):
+        """Banco indisponível sem stale → 503."""
+        mock_pool.connection.side_effect = Exception("DB down")
+        r = client.get("/socios/buscar?digitos=123456&nome=JOAO+DA+SILVA")
+        assert r.status_code == 503
+
+    def test_buscar_banco_indisponivel_com_stale_retorna_dados(self, mock_pool, mock_redis):
+        """Banco indisponível com stale no Redis → retorna dados com X-Cache: STALE."""
+        stale_data = [{"cnpj_completo": "11111111000141", "cnpj_basico": "11111111",
+                       "cnpj_ordem": "0001", "cnpj_dv": "41",
+                       "razao_social": "EMPRESA ALPHA LTDA", "nome_fantasia": "ALPHA STORE",
+                       "uf": "SP", "situacao_cadastral": "02",
+                       "run_key": "2026-01", "updated_at": "2026-01-01T00:00:00+00:00",
+                       "socios": []}]
+        mock_redis.get = AsyncMock(side_effect=[
+            None,
+            json.dumps(stale_data, default=str),
+        ])
+        mock_pool.connection.side_effect = Exception("DB down")
+        with patch("api.main.psycopg_pool.AsyncConnectionPool", return_value=mock_pool), \
+             patch("api.main.aioredis.from_url", return_value=mock_redis):
+            with TestClient(app) as c:
+                r = c.get("/socios/buscar?digitos=123456&nome=JOAO+DA+SILVA")
+        assert r.status_code == 200
+        assert r.headers.get("X-Cache") == "STALE"
+        assert r.json()[0]["cnpj_completo"] == "11111111000141"
+
+    def test_buscar_monta_cpf_mascarado_corretamente(self, client, mock_cursor):
+        """A query deve usar o padrão ***XXXXXX** exato da RF."""
+        from tests.conftest import _SAMPLE_EMPRESA, _SAMPLE_SOCIO
+        mock_cursor.fetchall = AsyncMock(side_effect=[
+            [_SAMPLE_EMPRESA],
+            [_SAMPLE_SOCIO],
+        ])
+        client.get("/socios/buscar?digitos=324968&nome=JOAO+DA+SILVA")
+        main_call = mock_cursor.execute.call_args_list[1]
+        assert main_call[0][1] == ("***324968**", "JOAO DA SILVA")

@@ -22,6 +22,7 @@ from api.routes import cnpj as cnpj_router
 from api.routes import health as health_router
 from api.routes import runs as runs_router
 from api.routes import search as search_router
+from api.routes import socios as socios_router
 from config import settings
 
 
@@ -69,3 +70,4 @@ app.include_router(runs_router.router,   prefix="/runs",   tags=["Runs"])
 # Rotas principais — API Key obrigatória (configurada em cada router)
 app.include_router(cnpj_router.router,    prefix="/cnpj",    tags=["CNPJ"])
 app.include_router(search_router.router,  prefix="/search",  tags=["Busca"])
+app.include_router(socios_router.router,  prefix="/socios",  tags=["Sócios"])
