@@ -17,6 +17,7 @@ Fluxo após o swap do load_step:
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 import psycopg
@@ -198,6 +199,33 @@ def _flush_redis_cache() -> None:
         log.warning(f"Redis flush ignorado: {exc}")
 
 
+def _apply_session_settings(conn: psycopg.Connection) -> None:
+    """Aplica work_mem e parallel workers na sessão para reduzir spill para disco."""
+    conn.execute(f"SET work_mem = '{settings.index_work_mem}'")
+    conn.execute(f"SET max_parallel_workers_per_gather = {settings.index_parallel_workers}")
+    log.info(
+        f"session settings: work_mem={settings.index_work_mem}, "
+        f"max_parallel_workers_per_gather={settings.index_parallel_workers}"
+    )
+
+
+def _choose_refresh_strategy() -> str:
+    """
+    Retorna 'concurrent' se houver espaço livre suficiente, 'fallback' caso contrário.
+    Checa o volume de settings.data_dir (mesmo disco que o PostgreSQL neste setup).
+    """
+    free_bytes = shutil.disk_usage(settings.data_dir).free
+    free_gb = free_bytes / 1024 ** 3
+    if free_gb >= settings.index_min_free_gb:
+        log.info(f"disco livre: {free_gb:.1f} GB >= {settings.index_min_free_gb} GB — REFRESH CONCURRENTLY")
+        return "concurrent"
+    log.warning(
+        f"disco livre: {free_gb:.1f} GB < {settings.index_min_free_gb} GB — "
+        f"fallback: DROP CASCADE + full rebuild"
+    )
+    return "fallback"
+
+
 # ── Step principal ───────────────────────────────────────────────────────────
 
 def run(job_id: str, run_key: str, checkpoint_dir: Path) -> StepResult:
@@ -211,18 +239,32 @@ def run(job_id: str, run_key: str, checkpoint_dir: Path) -> StepResult:
                 # MV foi dropada pelo CASCADE no load_step (dep em tabela _old)
                 # ou é a primeira execução após setup.py sem schema.sql aplicado
                 _recreate_mv(conn)
+                _apply_session_settings(conn)
                 log.info("refreshing mv_cnpj_full (full rebuild após recriação)...")
                 conn.execute(f"REFRESH MATERIALIZED VIEW {_V}.mv_cnpj_full")
 
             elif status == "empty":
                 # Primeira carga real — MV existe mas nunca foi populada
+                _apply_session_settings(conn)
                 log.info("first-ever refresh of mv_cnpj_full (non-concurrent)...")
                 conn.execute(f"REFRESH MATERIALIZED VIEW {_V}.mv_cnpj_full")
 
             else:
-                # Atualização normal — REFRESH CONCURRENTLY não bloqueia leitores
-                log.info("refreshing mv_cnpj_full CONCURRENTLY (non-blocking)...")
-                conn.execute(f"REFRESH MATERIALIZED VIEW CONCURRENTLY {_V}.mv_cnpj_full")
+                # Atualização normal — aplica settings de sessão e verifica disco
+                _apply_session_settings(conn)
+                strategy = _choose_refresh_strategy()
+
+                if strategy == "concurrent":
+                    log.info("refreshing mv_cnpj_full CONCURRENTLY (non-blocking)...")
+                    conn.execute(f"REFRESH MATERIALIZED VIEW CONCURRENTLY {_V}.mv_cnpj_full")
+                else:
+                    # Fallback: DROP CASCADE + full rebuild (bloqueante, ~45 min)
+                    # stale cache da API cobre leitores durante o rebuild
+                    log.warning("executando fallback: DROP CASCADE + full rebuild...")
+                    conn.execute(f"DROP MATERIALIZED VIEW IF EXISTS {_V}.mv_cnpj_full CASCADE")
+                    _recreate_mv(conn)
+                    log.info("refreshing mv_cnpj_full (full rebuild — fallback)...")
+                    conn.execute(f"REFRESH MATERIALIZED VIEW {_V}.mv_cnpj_full")
 
             log.info("refresh complete — counting rows...")
             row = conn.execute(f"SELECT COUNT(*) FROM {_V}.mv_cnpj_full").fetchone()
