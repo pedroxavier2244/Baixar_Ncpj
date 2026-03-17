@@ -521,3 +521,48 @@ def test_run_writes_load_manifest_on_success(tmp_path: Path):
 
     data = json.loads(load_manifest_path.read_text(encoding="utf-8"))
     assert isinstance(data.get("tables"), list), "'tables' must be a list"
+
+
+def test_run_cleans_etl_files_after_swap(tmp_path):
+    """After a successful load, ZIPs and intermediate CSVs must be deleted."""
+    import json
+    from unittest.mock import patch, MagicMock
+    from steps.load_step import run
+
+    run_key = "2026-03"
+    data_dir = tmp_path / run_key
+    csv_subdir = data_dir / "csv"
+    transformed_dir = data_dir / "transformed"
+    csv_subdir.mkdir(parents=True)
+    transformed_dir.mkdir(parents=True)
+
+    zip_file = data_dir / "Empresas0.zip"
+    part_file = data_dir / "Empresas0.part"
+    csv_file = csv_subdir / "empresas.csv"
+    transformed_file = transformed_dir / "empresas.csv"
+
+    for f in [zip_file, part_file, csv_file, transformed_file]:
+        f.write_text("data")
+
+    checkpoint_dir = tmp_path / "checkpoint"
+    checkpoint_dir.mkdir()
+    manifest = {"out_dir": str(transformed_dir), "tables": []}
+    (checkpoint_dir / "transform_manifest.json").write_text(json.dumps(manifest))
+
+    with patch("steps.load_step.settings") as mock_settings, \
+         patch("psycopg.connect") as mock_connect:
+        mock_settings.postgres_url = "postgresql://fake"
+        mock_settings.data_dir = tmp_path
+        mock_settings.pg_schema = "cnpj"
+        mock_settings.pg_staging_schema = "cnpj_staging"
+        fake_conn = MagicMock()
+        fake_conn.__enter__ = MagicMock(return_value=fake_conn)
+        fake_conn.__exit__ = MagicMock(return_value=False)
+        mock_connect.return_value = fake_conn
+
+        result = run("job1", run_key, checkpoint_dir)
+
+    assert not zip_file.exists(), "ZIP should be deleted after load"
+    assert not part_file.exists(), ".part file should be deleted after load"
+    assert not csv_file.exists(), "intermediate CSV should be deleted after load"
+    assert transformed_file.exists(), "transformed CSV must NOT be deleted"

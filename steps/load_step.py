@@ -311,6 +311,39 @@ def _load_lookup(conn: psycopg.Connection, pg_table: str, csv_path: Path) -> int
     return count
 
 
+# ── Limpeza pós-swap ────────────────────────────────────────────────────────
+
+def _cleanup_etl_files(run_key: str) -> None:
+    """
+    Remove ZIPs e CSVs intermediários do run atual após o swap bem-sucedido.
+    Mantém o subdiretório transformed/ (auditoria).
+    Erros são não-fatais — logados como WARNING.
+    """
+    data_dir = settings.data_dir / run_key
+    removed = 0
+    for pattern in ("*.zip", "*.part"):
+        for p in data_dir.glob(pattern):
+            try:
+                p.unlink()
+                removed += 1
+            except Exception as exc:
+                log.warning(f"could not remove {p}: {exc}")
+    csv_dir = data_dir / "csv"
+    if csv_dir.exists():
+        for p in csv_dir.glob("*"):
+            try:
+                p.unlink()
+                removed += 1
+            except Exception as exc:
+                log.warning(f"could not remove {p}: {exc}")
+        try:
+            csv_dir.rmdir()
+        except OSError:
+            pass
+    if removed:
+        log.info(f"[post-swap cleanup] removed {removed} temp files from {data_dir}")
+
+
 # ── Step principal ──────────────────────────────────────────────────────────
 
 def run(job_id: str, run_key: str, checkpoint_dir: Path) -> StepResult:
@@ -417,6 +450,9 @@ def run(job_id: str, run_key: str, checkpoint_dir: Path) -> StepResult:
     except Exception as exc:
         import traceback
         return StepResult.failed(f"load failed: {exc}\n{traceback.format_exc()}")
+
+    # Libera espaço em disco antes do index_step
+    _cleanup_etl_files(run_key)
 
     artifact = checkpoint_dir / "load_manifest.json"
     write_artifact(artifact, {"run_key": run_key, "tables": results})
