@@ -54,6 +54,11 @@ class Settings(BaseSettings):
     # Timeout de query no banco (ms) — evita query lenta travar o pool
     db_query_timeout_ms: int = 8000
 
+    # Index step — disk safety and performance
+    index_min_free_gb: int = 50       # mínimo de espaço livre antes do REFRESH CONCURRENTLY
+    index_work_mem: str = "2GB"       # work_mem da sessão durante o REFRESH (reduz spill para disco)
+    index_parallel_workers: int = 4   # max_parallel_workers_per_gather durante o REFRESH
+
     # Postgres schemas (banco corporativo compartilhado — nunca usar "public")
     pg_schema: str = "cnpj"                  # dados finais tratados
     pg_staging_schema: str = "cnpj_staging"  # staging UNLOGGED (COPY rápido)
