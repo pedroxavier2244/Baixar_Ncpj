@@ -176,11 +176,14 @@ async def get_participacoes(cnpj: str, request: Request, response: Response):
                 await cur.execute(_TIMEOUT)
                 await cur.execute(
                     f"""
-                    SELECT DISTINCT mv.*
+                    SELECT mv.*
                     FROM {_MV} mv
-                    INNER JOIN {_SOCIOS} s ON s.cnpj_basico = mv.cnpj_basico
-                    WHERE s.identificador_socio = '1'
-                      AND s.cnpj_cpf_socio = %s
+                    WHERE mv.cnpj_basico IN (
+                        SELECT cnpj_basico
+                        FROM {_SOCIOS}
+                        WHERE identificador_socio = '1'
+                          AND cnpj_cpf_socio = %s
+                    )
                     ORDER BY mv.razao_social
                     LIMIT 100
                     """,
