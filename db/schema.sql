@@ -301,6 +301,9 @@ CREATE INDEX IF NOT EXISTS idx_mv_nome_fantasia_trgm
 CREATE INDEX IF NOT EXISTS idx_mv_municipio
     ON cnpj_serving.mv_cnpj_full (municipio);
 
+CREATE INDEX IF NOT EXISTS idx_mv_municipio_descricao_trgm
+    ON cnpj_serving.mv_cnpj_full USING gin (municipio_descricao gin_trgm_ops);
+
 CREATE INDEX IF NOT EXISTS idx_mv_uf
     ON cnpj_serving.mv_cnpj_full (uf);
 
