@@ -21,5 +21,5 @@ def test_index_defaults():
     from config import Settings
     s = Settings()
     assert s.index_min_free_gb == 50
-    assert s.index_work_mem == "2GB"
-    assert s.index_parallel_workers == 4
+    assert s.index_work_mem == "256MB"
+    assert s.index_parallel_workers == 2
