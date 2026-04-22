@@ -22,4 +22,4 @@ def test_index_defaults():
     s = Settings()
     assert s.index_min_free_gb == 50
     assert s.index_work_mem == "256MB"
-    assert s.index_parallel_workers == 2
+    assert s.index_parallel_workers == 0

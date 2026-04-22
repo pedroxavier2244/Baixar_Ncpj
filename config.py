@@ -56,8 +56,8 @@ class Settings(BaseSettings):
 
     # Index step — disk safety and performance
     index_min_free_gb: int = 50       # mínimo de espaço livre antes do REFRESH CONCURRENTLY
-    index_work_mem: str = "256MB"     # work_mem da sessão durante o REFRESH — 2GB esgotava /dev/shm (64MB default Docker)
-    index_parallel_workers: int = 2   # max_parallel_workers_per_gather durante o REFRESH
+    index_work_mem: str = "256MB"     # work_mem da sessão durante o REFRESH
+    index_parallel_workers: int = 0   # 0 = sem paralelismo — evita alocação de /dev/shm (64MB limite Docker)
 
     # Postgres schemas (banco corporativo compartilhado — nunca usar "public")
     pg_schema: str = "cnpj"                  # dados finais tratados
