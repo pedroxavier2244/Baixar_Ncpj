@@ -94,7 +94,7 @@ _MAIN_TABLES = [
 
 def _empresas_new_ddl(run_key: str) -> str:
     return f"""
-CREATE TABLE {_D}.rf_empresas_new (
+CREATE UNLOGGED TABLE {_D}.rf_empresas_new (
     cnpj_basico                  CHAR(8)     NOT NULL,
     razao_social                 TEXT,
     natureza_juridica            CHAR(4),
@@ -111,7 +111,7 @@ CREATE TABLE {_D}.rf_empresas_new (
 
 def _estab_new_ddl(run_key: str) -> str:
     return f"""
-CREATE TABLE {_D}.rf_estabelecimentos_new (
+CREATE UNLOGGED TABLE {_D}.rf_estabelecimentos_new (
     cnpj_basico                  CHAR(8)     NOT NULL,
     cnpj_ordem                   CHAR(4)     NOT NULL,
     cnpj_dv                      CHAR(2)     NOT NULL,
@@ -153,7 +153,7 @@ def _socios_new_ddl(run_key: str) -> str:
     # id GENERATED ALWAYS AS IDENTITY: preenchido automaticamente durante COPY
     # (id não está em _SOCIOS_COLS, então o COPY especifica apenas as colunas de dados)
     return f"""
-CREATE TABLE {_D}.rf_socios_new (
+CREATE UNLOGGED TABLE {_D}.rf_socios_new (
     id                           BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     cnpj_basico                  CHAR(8),
     identificador_socio          CHAR(1),
@@ -174,7 +174,7 @@ CREATE TABLE {_D}.rf_socios_new (
 
 def _simples_new_ddl(run_key: str) -> str:
     return f"""
-CREATE TABLE {_D}.rf_simples_new (
+CREATE UNLOGGED TABLE {_D}.rf_simples_new (
     cnpj_basico           CHAR(8)     NOT NULL,
     opcao_pelo_simples    CHAR(1),
     data_opcao_simples    CHAR(8),
@@ -357,6 +357,10 @@ def run(job_id: str, run_key: str, checkpoint_dir: Path) -> StepResult:
 
     try:
         with psycopg.connect(settings.postgres_url, autocommit=False) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SET work_mem = '32MB'")
+                cur.execute("SET maintenance_work_mem = '256MB'")
+            conn.commit()
 
             # Passo 0: limpar _old do run anterior (CASCADE remove MV obsoleta)
             _drop_previous_old_tables(conn)
