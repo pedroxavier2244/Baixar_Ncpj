@@ -150,6 +150,66 @@ async def get_socios(cnpj: str, request: Request, response: Response):
     return result
 
 
+@router.get("/{cnpj}/completo")
+@limiter.limit(settings.rate_limit_cnpj)
+async def get_cnpj_completo(cnpj: str, request: Request, response: Response):
+    """
+    Retorna dados completos do CNPJ com sócios numerados (socio1, socio2, ...).
+    """
+    cnpj_clean = "".join(c for c in cnpj if c.isdigit())
+    if len(cnpj_clean) not in (8, 14):
+        raise HTTPException(status_code=400, detail="CNPJ deve ter 8 (base) ou 14 dígitos")
+
+    cache_key = f"cnpj_completo:{cnpj_clean}"
+
+    cached = await _redis_get(request.app.state.redis, cache_key)
+    if cached:
+        await _redis_incr(request.app.state.redis, "stats:cache_hits")
+        return json.loads(cached)
+
+    await _redis_incr(request.app.state.redis, "stats:cache_misses")
+    try:
+        async with request.app.state.pool.connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(_TIMEOUT)
+                await cur.execute(_SELECT, (cnpj_clean, cnpj_clean))
+                row = await cur.fetchone()
+
+                if not row:
+                    raise HTTPException(status_code=404, detail=f"CNPJ {cnpj_clean} não encontrado")
+
+                await cur.execute(
+                    f"SELECT * FROM {_SOCIOS} WHERE cnpj_basico = %s ORDER BY nome_socio",
+                    (row["cnpj_basico"],),
+                )
+                socios_rows = await cur.fetchall()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        stale = await _redis_get(request.app.state.redis, f"stale:{cache_key}")
+        if stale:
+            response.headers["X-Cache"] = "STALE"
+            return json.loads(stale)
+        detail = (
+            "Banco de dados sobrecarregado. Tente novamente."
+            if "statement timeout" in str(exc).lower()
+            else "Erro ao consultar banco de dados."
+        )
+        raise HTTPException(status_code=503, detail=detail)
+
+    data = dict(row)
+    for i, s in enumerate(socios_rows, start=1):
+        data[f"socio{i}"] = SocioResponse(**s).model_dump()
+
+    await _redis_set(
+        request.app.state.redis,
+        cache_key,
+        json.dumps(data, default=str),
+    )
+
+    return data
+
+
 @router.get("/{cnpj}/participacoes", response_model=list[CNPJWithSociosResponse])
 @limiter.limit(settings.rate_limit_cnpj)
 async def get_participacoes(cnpj: str, request: Request, response: Response):
