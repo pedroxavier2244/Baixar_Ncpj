@@ -45,6 +45,8 @@ def _ddl_patch_load(monkeypatch, schema: str) -> None:
     """
     import steps.load_step as ls
 
+    # DDLs de teste SEM primary key inline — a PK é adicionada pelo load após o
+    # dedup (mesmo contrato das DDLs reais).
     monkeypatch.setattr(
         ls, "_empresas_new_ddl",
         lambda rk: f"""
@@ -58,8 +60,7 @@ CREATE TABLE {schema}.rf_empresas_new (
     ente_federativo_responsavel  TEXT,
     run_key                      CHAR(7)     DEFAULT '{rk}',
     created_at                   TIMESTAMPTZ DEFAULT NOW(),
-    updated_at                   TIMESTAMPTZ DEFAULT NOW(),
-    PRIMARY KEY (cnpj_basico)
+    updated_at                   TIMESTAMPTZ DEFAULT NOW()
 )""",
     )
 
@@ -99,8 +100,7 @@ CREATE TABLE {schema}.rf_estabelecimentos_new (
     data_situacao_especial       CHAR(8),
     run_key                      CHAR(7)     DEFAULT '{rk}',
     created_at                   TIMESTAMPTZ DEFAULT NOW(),
-    updated_at                   TIMESTAMPTZ DEFAULT NOW(),
-    PRIMARY KEY (cnpj_basico, cnpj_ordem, cnpj_dv)
+    updated_at                   TIMESTAMPTZ DEFAULT NOW()
 )""",
     )
 
@@ -138,8 +138,7 @@ CREATE TABLE {schema}.rf_simples_new (
     data_opcao_mei        CHAR(8),
     data_exclusao_mei     CHAR(8),
     run_key               CHAR(7)     DEFAULT '{rk}',
-    updated_at            TIMESTAMPTZ DEFAULT NOW(),
-    PRIMARY KEY (cnpj_basico)
+    updated_at            TIMESTAMPTZ DEFAULT NOW()
 )""",
     )
 
@@ -209,6 +208,69 @@ def test_build_new_table_does_not_touch_live(test_db, sample_csvs, monkeypatch):
     assert _table_exists(conn, schema, "rf_empresas_new"), "rf_empresas_new was not created"
     new_count = _count_rows(conn, f"{schema}.rf_empresas_new")
     assert new_count > 0, "rf_empresas_new is empty after build"
+
+
+# ── Test 1b — regressão do bug de cnpj_basico duplicado na fonte RF ──────────
+
+def test_build_new_table_dedups_duplicate_source_key(test_db, tmp_path, monkeypatch):
+    """
+    Quando o CSV da RF traz o mesmo cnpj_basico duas vezes (registro real + stub
+    vazio), _build_new_table com pk_cols deve:
+      - manter UMA linha para a chave (a mais completa — o registro real)
+      - adicionar a PRIMARY KEY sem UniqueViolation
+    Reproduz o incidente de 2026-06 (cnpj_basico 08314885 duplicado).
+    """
+    from steps.load_step import _build_new_table, _EMPRESAS_COLS
+
+    schema = test_db["schema"]
+    conn   = test_db["conn"]
+
+    _ddl_patch_load(monkeypatch, schema)
+
+    # Registro real primeiro, stub vazio depois — e também o caso inverso (stub
+    # primeiro) para garantir que a ordem física não decide o vencedor.
+    csv_path = tmp_path / "empresas_dup.csv"
+    csv_path.write_text(
+        "cnpj_basico,razao_social,natureza_juridica,qualificacao_responsavel,"
+        "capital_social,porte,ente_federativo_responsavel\n"
+        "08314885,FLAVIO PAVAO DE SOUZA,4120,59,\"0,00\",05,\n"
+        "08314885,,0000,00,\"0,00\",,\n"
+        "00000002,,,,,,\n"                                  # stub primeiro
+        "00000002,EMPRESA COMPLETA LTDA,2062,49,\"1000,00\",03,\n",
+        encoding="utf-8",
+    )
+
+    import steps.load_step as ls
+    create_ddl = ls._empresas_new_ddl("2026-06")
+
+    _build_new_table(
+        conn,
+        new_table=f"{schema}.rf_empresas_new",
+        create_ddl=create_ddl,
+        csv_path=csv_path,
+        columns=_EMPRESAS_COLS,
+        index_sqls=[],
+        pk_cols=["cnpj_basico"],
+    )
+
+    # Uma linha por chave
+    assert _count_rows(conn, f"{schema}.rf_empresas_new") == 2
+
+    # A linha mantida é a mais completa (razao_social preenchida) em ambos os casos
+    rows = dict(conn.execute(
+        f"SELECT cnpj_basico, razao_social FROM {schema}.rf_empresas_new"
+    ).fetchall())
+    assert rows["08314885"].strip() == "FLAVIO PAVAO DE SOUZA"
+    assert rows["00000002"].strip() == "EMPRESA COMPLETA LTDA"
+
+    # A PRIMARY KEY foi criada (chave única garantida daqui pra frente)
+    pk = conn.execute(
+        "SELECT 1 FROM information_schema.table_constraints "
+        "WHERE table_schema=%s AND table_name='rf_empresas_new' "
+        "AND constraint_type='PRIMARY KEY'",
+        (schema,),
+    ).fetchone()
+    assert pk is not None, "PRIMARY KEY não foi adicionada após o dedup"
 
 
 # ── Test 2 ───────────────────────────────────────────────────────────────────

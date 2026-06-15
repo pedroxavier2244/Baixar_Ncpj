@@ -92,6 +92,10 @@ _MAIN_TABLES = [
 # run_key e timestamps definidos como DEFAULT → preenchidos automaticamente
 # pelo COPY sem precisar de UPDATE posterior (muito mais rápido em 60M linhas).
 
+# NOTA: a PRIMARY KEY NÃO é declarada inline. Os dados da RF ocasionalmente
+# trazem o mesmo cnpj_basico duas vezes (registro real + stub vazio); por isso
+# o COPY entra sem PK, deduplica-se (mantendo a linha mais completa) e só então
+# o load adiciona a PK. Ver _dedup_in_place / _build_new_table(pk_cols=...).
 def _empresas_new_ddl(run_key: str) -> str:
     return f"""
 CREATE UNLOGGED TABLE {_D}.rf_empresas_new (
@@ -104,8 +108,7 @@ CREATE UNLOGGED TABLE {_D}.rf_empresas_new (
     ente_federativo_responsavel  TEXT,
     run_key                      CHAR(7)     DEFAULT '{run_key}',
     created_at                   TIMESTAMPTZ DEFAULT NOW(),
-    updated_at                   TIMESTAMPTZ DEFAULT NOW(),
-    PRIMARY KEY (cnpj_basico)
+    updated_at                   TIMESTAMPTZ DEFAULT NOW()
 )"""
 
 
@@ -144,9 +147,8 @@ CREATE UNLOGGED TABLE {_D}.rf_estabelecimentos_new (
     data_situacao_especial       CHAR(8),
     run_key                      CHAR(7)     DEFAULT '{run_key}',
     created_at                   TIMESTAMPTZ DEFAULT NOW(),
-    updated_at                   TIMESTAMPTZ DEFAULT NOW(),
-    PRIMARY KEY (cnpj_basico, cnpj_ordem, cnpj_dv)
-)"""
+    updated_at                   TIMESTAMPTZ DEFAULT NOW()
+)"""  # PK composta adicionada após o dedup — ver _build_new_table(pk_cols=...)
 
 
 def _socios_new_ddl(run_key: str) -> str:
@@ -183,9 +185,8 @@ CREATE UNLOGGED TABLE {_D}.rf_simples_new (
     data_opcao_mei        CHAR(8),
     data_exclusao_mei     CHAR(8),
     run_key               CHAR(7)     DEFAULT '{run_key}',
-    updated_at            TIMESTAMPTZ DEFAULT NOW(),
-    PRIMARY KEY (cnpj_basico)
-)"""
+    updated_at            TIMESTAMPTZ DEFAULT NOW()
+)"""  # PK adicionada após o dedup — ver _build_new_table(pk_cols=...)
 
 
 # ── Helpers de baixo nível ──────────────────────────────────────────────────
@@ -241,6 +242,49 @@ def _drop_previous_old_tables(conn: psycopg.Connection) -> None:
 
 # ── Build + swap ────────────────────────────────────────────────────────────
 
+def _dedup_in_place(
+    conn: psycopg.Connection,
+    table: str,
+    key_cols: list[str],
+    data_cols: list[str],
+) -> int:
+    """
+    Remove duplicatas pela chave natural, mantendo a linha mais completa.
+
+    Os arquivos da RF ocasionalmente trazem o mesmo cnpj_basico duas vezes —
+    tipicamente um registro real + um stub vazio. Sem dedup, o ADD PRIMARY KEY
+    seguinte falharia com UniqueViolation.
+
+    Critério de desempate: mantém a linha com mais colunas de dados preenchidas
+    (não-nulas); em empate, a primeira fisicamente (menor ctid).
+    Retorna a quantidade de linhas removidas.
+    """
+    key_list = ", ".join(key_cols)
+    completeness = " + ".join(f"({c} IS NOT NULL)::int" for c in data_cols) or "0"
+    sql = f"""
+        DELETE FROM {table} t
+        USING (
+            SELECT ctid,
+                   row_number() OVER (
+                       PARTITION BY {key_list}
+                       ORDER BY ({completeness}) DESC, ctid
+                   ) AS rn
+            FROM {table}
+        ) d
+        WHERE t.ctid = d.ctid AND d.rn > 1
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql)
+        removed = cur.rowcount
+    conn.commit()
+    if removed and removed > 0:
+        log.warning(
+            f"  {table}: {removed:,} linha(s) duplicada(s) por chave natural "
+            f"removida(s) (dado duplicado na fonte RF)"
+        )
+    return max(0, removed or 0)
+
+
 def _build_new_table(
     conn: psycopg.Connection,
     new_table: str,
@@ -248,10 +292,16 @@ def _build_new_table(
     csv_path: Path,
     columns: list[str],
     index_sqls: list[str],
+    pk_cols: list[str] | None = None,
 ) -> int:
     """
     Cria <nome>_new do zero, COPY do CSV, cria índices.
     Retorna contagem aproximada de linhas.
+
+    Se pk_cols for informado, a tabela é criada SEM primary key inline; após o
+    COPY, deduplica-se pela chave natural (mantendo a linha mais completa) e só
+    então adiciona-se a PRIMARY KEY. Isso torna o load resiliente a cnpj_basico
+    duplicado na fonte da RF. Tabelas com PK sintética (socios) passam pk_cols=None.
     """
     # Remove tentativa anterior com falha
     with conn.cursor() as cur:
@@ -267,7 +317,17 @@ def _build_new_table(
     conn.commit()
     log.info(f"  {new_table}: ~{count:,} rows loaded")
 
-    # Índices criados APÓS a carga = drasticamente mais rápido
+    # Dedup pela chave natural + ADD PRIMARY KEY (antes dos índices secundários).
+    if pk_cols:
+        data_cols = [c for c in columns if c not in pk_cols]
+        _dedup_in_place(conn, new_table, pk_cols, data_cols)
+        key_list = ", ".join(pk_cols)
+        with conn.cursor() as cur:
+            cur.execute(f"ALTER TABLE {new_table} ADD PRIMARY KEY ({key_list})")
+        conn.commit()
+        log.info(f"  {new_table}: PRIMARY KEY ({key_list}) criada após dedup")
+
+    # Índices secundários criados APÓS a carga = drasticamente mais rápido
     # Drop pelo nome antes de criar — o swap renomeia a tabela mas mantém o nome do índice,
     # então tentativas seguintes encontrariam o índice "órfão" na tabela live.
     for idx_sql in index_sqls:
@@ -375,22 +435,23 @@ def run(job_id: str, run_key: str, checkpoint_dir: Path) -> StepResult:
                     continue
 
                 if tbl_key == "empresas":
+                    # Sem índice secundário: a PRIMARY KEY (cnpj_basico) já indexa a chave.
                     count = _build_new_table(
                         conn,
                         new_table=f"{_D}.rf_empresas_new",
                         create_ddl=_empresas_new_ddl(run_key),
                         csv_path=csv_path,
                         columns=_EMPRESAS_COLS,
-                        index_sqls=[
-                            f"CREATE INDEX idx_rf_empresas_new_pk "
-                            f"ON {_D}.rf_empresas_new (cnpj_basico)",
-                        ],
+                        index_sqls=[],
+                        pk_cols=["cnpj_basico"],
                     )
                     _swap_table(conn, f"{_D}.rf_empresas")
                     results.append({"table": f"{_D}.rf_empresas", "inserted": count})
                     log.info(f"rf_empresas swapped — {count:,} rows")
 
                 elif tbl_key == "estabelecimentos":
+                    # A PK composta já indexa (cnpj_basico, cnpj_ordem, cnpj_dv);
+                    # mantém-se apenas o índice por cnpj_basico isolado (lookups por raiz).
                     count = _build_new_table(
                         conn,
                         new_table=f"{_D}.rf_estabelecimentos_new",
@@ -398,11 +459,10 @@ def run(job_id: str, run_key: str, checkpoint_dir: Path) -> StepResult:
                         csv_path=csv_path,
                         columns=_ESTAB_COLS,
                         index_sqls=[
-                            f"CREATE INDEX idx_rf_estab_new_pk "
-                            f"ON {_D}.rf_estabelecimentos_new (cnpj_basico, cnpj_ordem, cnpj_dv)",
                             f"CREATE INDEX idx_rf_estab_new_cnpj_basico "
                             f"ON {_D}.rf_estabelecimentos_new (cnpj_basico)",
                         ],
+                        pk_cols=["cnpj_basico", "cnpj_ordem", "cnpj_dv"],
                     )
                     _swap_table(conn, f"{_D}.rf_estabelecimentos")
                     results.append({"table": f"{_D}.rf_estabelecimentos", "inserted": count})
@@ -427,16 +487,15 @@ def run(job_id: str, run_key: str, checkpoint_dir: Path) -> StepResult:
                     log.info(f"rf_socios swapped — {count:,} rows")
 
                 elif tbl_key == "simples":
+                    # Sem índice secundário: a PRIMARY KEY (cnpj_basico) já indexa a chave.
                     count = _build_new_table(
                         conn,
                         new_table=f"{_D}.rf_simples_new",
                         create_ddl=_simples_new_ddl(run_key),
                         csv_path=csv_path,
                         columns=_SIMPLES_COLS,
-                        index_sqls=[
-                            f"CREATE INDEX idx_rf_simples_new_cnpj_basico "
-                            f"ON {_D}.rf_simples_new (cnpj_basico)",
-                        ],
+                        index_sqls=[],
+                        pk_cols=["cnpj_basico"],
                     )
                     _swap_table(conn, f"{_D}.rf_simples")
                     results.append({"table": f"{_D}.rf_simples", "inserted": count})

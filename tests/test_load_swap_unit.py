@@ -51,6 +51,8 @@ class FakeCopy:
 class FakeCursor:
     """Context-manager cursor that records SQL and returns pre-configured results."""
 
+    rowcount = 0  # usado por _dedup_in_place (nº de linhas removidas)
+
     def __init__(self, conn):
         self._conn = conn
 
@@ -115,17 +117,23 @@ class FakeConn:
 
 # ── DDL tests ────────────────────────────────────────────────────────────────
 
-def test_empresas_ddl_has_primary_key():
-    """_empresas_new_ddl must declare cnpj_basico as PRIMARY KEY."""
+def test_empresas_ddl_has_no_inline_pk():
+    """
+    _empresas_new_ddl must NOT declare an inline PRIMARY KEY.
+    A PK é adicionada após o dedup (ver _build_new_table). cnpj_basico continua NOT NULL.
+    """
     ddl = _empresas_new_ddl("2026-03")
-    assert "PRIMARY KEY" in ddl
-    assert "cnpj_basico" in ddl
+    assert "PRIMARY KEY" not in ddl
+    assert "cnpj_basico                  CHAR(8)     NOT NULL" in ddl
 
 
-def test_estab_ddl_has_composite_pk():
-    """_estab_new_ddl must declare a composite PRIMARY KEY on the three CNPJ components."""
+def test_estab_ddl_has_no_inline_pk():
+    """_estab_new_ddl must NOT declare an inline PRIMARY KEY (added post-dedup)."""
     ddl = _estab_new_ddl("2026-03")
-    assert "PRIMARY KEY (cnpj_basico, cnpj_ordem, cnpj_dv)" in ddl
+    assert "PRIMARY KEY" not in ddl
+    # As três colunas da chave continuam NOT NULL
+    for col in ("cnpj_basico", "cnpj_ordem", "cnpj_dv"):
+        assert col in ddl
 
 
 def test_socios_ddl_has_identity():
@@ -134,12 +142,11 @@ def test_socios_ddl_has_identity():
     assert "GENERATED ALWAYS AS IDENTITY" in ddl
 
 
-def test_simples_ddl_has_pk():
-    """_simples_new_ddl must declare PRIMARY KEY (cnpj_basico)."""
+def test_simples_ddl_has_no_inline_pk():
+    """_simples_new_ddl must NOT declare an inline PRIMARY KEY (added post-dedup)."""
     ddl = _simples_new_ddl("2026-03")
-    assert "PRIMARY KEY (cnpj_basico)" in ddl or (
-        "PRIMARY KEY" in ddl and "cnpj_basico" in ddl
-    )
+    assert "PRIMARY KEY" not in ddl
+    assert "cnpj_basico" in ddl
 
 
 def test_ddl_run_key_default_embedded():
@@ -352,6 +359,65 @@ def test_build_new_table_returns_row_count(tmp_path: Path):
     mock_copy.assert_called_once()
 
 
+def test_build_new_table_dedups_and_adds_pk_when_pk_cols(tmp_path: Path):
+    """
+    Com pk_cols, _build_new_table deve, NESTA ordem após o COPY:
+      1. rodar o DELETE de dedup (row_number() OVER PARTITION BY ...)
+      2. ADD PRIMARY KEY
+    e a tabela é criada SEM PK inline (a DDL passada não declara PRIMARY KEY).
+    """
+    csv_path = tmp_path / "test.csv"
+    csv_path.write_text("cnpj_basico,razao_social\n00000001,X\n", encoding="utf-8")
+
+    conn = FakeConn()
+    with patch("steps.load_step._copy_csv", return_value=1):
+        _build_new_table(
+            conn,
+            new_table="cnpj.rf_empresas_new",
+            create_ddl="CREATE UNLOGGED TABLE cnpj.rf_empresas_new (cnpj_basico CHAR(8), razao_social TEXT)",
+            csv_path=csv_path,
+            columns=["cnpj_basico", "razao_social"],
+            index_sqls=[],
+            pk_cols=["cnpj_basico"],
+        )
+
+    sqls = [s for s, _ in conn.executed]
+    dedup_pos = next(i for i, s in enumerate(sqls)
+                     if "DELETE FROM" in s.upper() and "ROW_NUMBER()" in s.upper())
+    addpk_pos = next(i for i, s in enumerate(sqls)
+                     if "ADD PRIMARY KEY" in s.upper())
+    create_pos = next(i for i, s in enumerate(sqls) if "CREATE UNLOGGED TABLE" in s.upper())
+
+    # dedup ocorre depois do CREATE e antes do ADD PRIMARY KEY
+    assert create_pos < dedup_pos < addpk_pos
+    # particiona pela chave e ordena por completude (nº de colunas não-nulas)
+    dedup_sql = sqls[dedup_pos]
+    assert "PARTITION BY cnpj_basico" in dedup_sql
+    assert "razao_social IS NOT NULL" in dedup_sql
+    assert "ADD PRIMARY KEY (cnpj_basico)" in sqls[addpk_pos]
+
+
+def test_build_new_table_no_pk_when_pk_cols_omitted(tmp_path: Path):
+    """Sem pk_cols (ex.: socios), não deve haver dedup nem ADD PRIMARY KEY."""
+    csv_path = tmp_path / "test.csv"
+    csv_path.write_text("col_a\nval1\n", encoding="utf-8")
+
+    conn = FakeConn()
+    with patch("steps.load_step._copy_csv", return_value=1):
+        _build_new_table(
+            conn,
+            new_table="cnpj.rf_socios_new",
+            create_ddl="CREATE UNLOGGED TABLE cnpj.rf_socios_new (col_a TEXT)",
+            csv_path=csv_path,
+            columns=["col_a"],
+            index_sqls=[],
+        )
+
+    sqls = " | ".join(s.upper() for s, _ in conn.executed)
+    assert "ADD PRIMARY KEY" not in sqls
+    assert "ROW_NUMBER()" not in sqls
+
+
 # ── run() tests ──────────────────────────────────────────────────────────────
 
 def _write_transform_manifest(checkpoint_dir: Path, out_dir: Path) -> None:
@@ -470,7 +536,7 @@ def test_run_calls_drop_old_first(tmp_path: Path):
     def fake_drop(conn):
         call_order.append("drop_old")
 
-    def fake_build(conn, new_table, create_ddl, csv_path, columns, index_sqls):
+    def fake_build(conn, new_table, create_ddl, csv_path, columns, index_sqls, pk_cols=None):
         call_order.append("build_new")
         return 10
 
