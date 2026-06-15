@@ -525,9 +525,9 @@ def test_monthly_update_cycle(test_db, tmp_path, monkeypatch):
             "cnae_fiscal_secundaria,tipo_logradouro,logradouro,numero,complemento,"
             "bairro,cep,uf,municipio,ddd1,telefone1,ddd2,telefone2,ddd_fax,fax,"
             "correio_eletronico,situacao_especial,data_situacao_especial\n"
-            "00000001,0001,00,1,,02,20200101,,,,20200101,6201500,,RUA,TESTE,1,,CENTRO,01310100,SP,7107,11,11111111,,,,,,,,\n"
-            "00000002,0001,00,1,,02,20200201,,,,20200201,6201500,,RUA,TESTE,2,,CENTRO,01310100,SP,7107,11,22222222,,,,,,,,\n"
-            "00000003,0001,00,1,,02,20200301,,,,20200301,6201500,,RUA,TESTE,3,,CENTRO,01310100,SP,7107,11,33333333,,,,,,,,\n"
+            "00000001,0001,00,1,,02,20200101,,,,20200101,6201500,,RUA,TESTE,1,,CENTRO,01310100,SP,7107,11,11111111,,,,,,,\n"
+            "00000002,0001,00,1,,02,20200201,,,,20200201,6201500,,RUA,TESTE,2,,CENTRO,01310100,SP,7107,11,22222222,,,,,,,\n"
+            "00000003,0001,00,1,,02,20200301,,,,20200301,6201500,,RUA,TESTE,3,,CENTRO,01310100,SP,7107,11,33333333,,,,,,,\n"
         ),
         "socios.csv": (
             "cnpj_basico,identificador_socio,nome_socio,cnpj_cpf_socio,"

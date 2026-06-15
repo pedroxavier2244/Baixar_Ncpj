@@ -113,9 +113,9 @@ cnpj_basico,razao_social,natureza_juridica,qualificacao_responsavel,capital_soci
 
 _ESTAB_CSV = """\
 cnpj_basico,cnpj_ordem,cnpj_dv,identificador_matriz_filial,nome_fantasia,situacao_cadastral,data_situacao_cadastral,motivo_situacao_cadastral,nm_cidade_exterior,pais,data_inicio_atividade,cnae_fiscal,cnae_fiscal_secundaria,tipo_logradouro,logradouro,numero,complemento,bairro,cep,uf,municipio,ddd1,telefone1,ddd2,telefone2,ddd_fax,fax,correio_eletronico,situacao_especial,data_situacao_especial
-00000001,0001,50,1,,02,20200101,,,,20200101,6201500,,RUA,TESTE,123,,CENTRO,01310100,SP,7107,11,11111111,,,,,,,,
-00000002,0001,50,1,,02,20200201,,,,20200201,6201500,,RUA,TESTE,456,,CENTRO,01310100,SP,7107,11,22222222,,,,,,,,
-00000003,0001,50,1,,02,20200301,,,,20200301,6201500,,RUA,TESTE,789,,CENTRO,01310100,SP,7107,11,33333333,,,,,,,,
+00000001,0001,50,1,,02,20200101,,,,20200101,6201500,,RUA,TESTE,123,,CENTRO,01310100,SP,7107,11,11111111,,,,,,,
+00000002,0001,50,1,,02,20200201,,,,20200201,6201500,,RUA,TESTE,456,,CENTRO,01310100,SP,7107,11,22222222,,,,,,,
+00000003,0001,50,1,,02,20200301,,,,20200301,6201500,,RUA,TESTE,789,,CENTRO,01310100,SP,7107,11,33333333,,,,,,,
 """
 
 _SOCIOS_CSV = """\
