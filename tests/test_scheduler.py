@@ -68,3 +68,30 @@ def test_check_and_enqueue_webdav_error(tmp_path):
         result = check_and_enqueue()
         assert result["status"] == "error"
         assert "connection refused" in result["reason"]
+
+
+from datetime import date, datetime
+
+
+def test_should_check_before_hour():
+    from scheduler import should_check
+    now = datetime(2026, 7, 23, 2, 0)   # 02h — antes da hora-alvo (03h)
+    assert should_check(now, 3, None) is False
+
+
+def test_should_check_at_hour_not_checked_today():
+    from scheduler import should_check
+    now = datetime(2026, 7, 23, 3, 30)  # 03h30, ainda não checou hoje
+    assert should_check(now, 3, None) is True
+
+
+def test_should_check_already_checked_today():
+    from scheduler import should_check
+    now = datetime(2026, 7, 23, 4, 0)   # já passou, mas já checou hoje
+    assert should_check(now, 3, date(2026, 7, 23)) is False
+
+
+def test_should_check_new_day_resets():
+    from scheduler import should_check
+    now = datetime(2026, 7, 24, 3, 5)   # novo dia, última checagem foi ontem
+    assert should_check(now, 3, date(2026, 7, 23)) is True
