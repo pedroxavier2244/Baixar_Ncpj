@@ -161,6 +161,68 @@ def _filter_wanted(items: list[dict]) -> list[dict]:
     ]
 
 
+def detect_wanted(run_key: str | None = None) -> tuple[str, list[dict]]:
+    """
+    Consulta o WebDAV da RF e devolve (run_key, lista de ZIPs desejados).
+    Levanta RuntimeError se não houver token ou se nenhum ZIP for encontrado.
+    Falhas de rede (PROPFIND) propagam como exceção httpx.
+    """
+    if not settings.webdav_token:
+        raise RuntimeError("WEBDAV_TOKEN is not set in .env")
+
+    items = propfind_listing(settings.webdav_token)
+    run_key = run_key or _detect_run_key(items)
+    wanted = _filter_wanted(items)
+    if not wanted:
+        month_items = propfind_listing(settings.webdav_token, rel_path=f"{run_key}/")
+        wanted = _filter_wanted(month_items)
+    if not wanted:
+        raise RuntimeError(
+            "no wanted ZIPs found in WebDAV listing - check token/URL and wanted_files config"
+        )
+    return run_key, wanted
+
+
+def check_and_enqueue(run_key: str | None = None, force: bool = False) -> dict:
+    """
+    Checa o WebDAV e enfileira um job se houver dado novo/alterado.
+    Nunca chama sys.exit. Retorna um dict com a chave "status":
+      enqueued | requeued | already_success | no_change | error
+    """
+    init_db()
+    settings.ensure_dirs()
+
+    try:
+        run_key, wanted = detect_wanted(run_key)
+    except Exception as exc:
+        log.error(f"WebDAV detection failed: {exc}")
+        return {"status": "error", "reason": str(exc)}
+
+    log.info(f"detected run_key={run_key}, files={len(wanted)}")
+
+    existing = get_job_by_run_key(run_key)
+    if existing and existing["status"] == "SUCCESS" and not force:
+        log.info(f"run_key={run_key} already SUCCESS - nothing to do")
+        return {"status": "already_success", "run_key": run_key}
+
+    old_manifest = _load_manifest(run_key)
+    if not _files_changed(old_manifest, wanted) and not force:
+        log.info(f"files unchanged since last run of {run_key} - skipping enqueue")
+        return {"status": "no_change", "run_key": run_key}
+
+    _save_manifest(run_key, wanted)
+    payload = {"files": wanted, "enqueued_at": datetime.now(timezone.utc).isoformat()}
+    if existing:
+        job_id = requeue_job(run_key, payload=payload)
+        log.info(f"job reset to PENDING job_id={job_id} run_key={run_key}")
+        status = "requeued"
+    else:
+        job_id = create_job(run_key, payload=payload)
+        log.info(f"job created job_id={job_id} run_key={run_key}")
+        status = "enqueued"
+    return {"status": status, "run_key": run_key, "job_id": job_id, "files": len(wanted)}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Enqueue CNPJ ETL job")
     parser.add_argument("--run-key", help="YYYY-MM to process (default: auto-detect)")
@@ -173,59 +235,23 @@ def main() -> None:
     init_db()
     settings.ensure_dirs()
 
-    if not settings.webdav_token:
-        log.error("WEBDAV_TOKEN is not set in .env â€” cannot proceed")
-        sys.exit(1)
-
     log.info("checking Receita Federal WebDAV for new files...")
-    try:
-        items = propfind_listing(settings.webdav_token)
-    except Exception as exc:
-        log.error(f"WebDAV listing failed: {exc}")
-        sys.exit(1)
-
-    run_key = args.run_key or _detect_run_key(items)
-    wanted = _filter_wanted(items)
-    if not wanted:
-        try:
-            month_items = propfind_listing(settings.webdav_token, rel_path=f"{run_key}/")
-            wanted = _filter_wanted(month_items)
-        except Exception as exc:
-            log.error(f"WebDAV month listing failed for {run_key}: {exc}")
-            sys.exit(1)
-
-    if not wanted:
-        log.error("no wanted ZIPs found in WebDAV listing - check token/URL and wanted_files config")
-        sys.exit(1)
-
-    log.info(f"detected run_key={run_key}, files={len(wanted)}")
 
     if args.check_only:
+        try:
+            run_key, wanted = detect_wanted(args.run_key)
+        except Exception as exc:
+            log.error(f"WebDAV detection failed: {exc}")
+            sys.exit(1)
         print(json.dumps({"run_key": run_key, "files": wanted}, indent=2, ensure_ascii=False))
         sys.exit(0)
 
-    # Check if already processed
-    existing = get_job_by_run_key(run_key)
-    if existing and existing["status"] == "SUCCESS" and not args.force:
-        log.info(f"run_key={run_key} already SUCCESS â€” nothing to do (use --force to override)")
-        sys.exit(0)
-
-    # Check if files changed since last manifest
-    old_manifest = _load_manifest(run_key)
-    if not _files_changed(old_manifest, wanted) and not args.force:
-        log.info(f"files unchanged since last run of {run_key} â€” skipping enqueue")
-        sys.exit(0)
-
-    # Save manifest and create/reset job
-    _save_manifest(run_key, wanted)
-    payload = {"files": wanted, "enqueued_at": datetime.now(timezone.utc).isoformat()}
-    if existing:
-        job_id = requeue_job(run_key, payload=payload)
-        log.info(f"job reset to PENDING job_id={job_id} run_key={run_key}")
-    else:
-        job_id = create_job(run_key, payload=payload)
-        log.info(f"job created job_id={job_id} run_key={run_key}")
-    print(f"OK job_id={job_id} run_key={run_key}")
+    result = check_and_enqueue(args.run_key, force=args.force)
+    if result["status"] == "error":
+        sys.exit(1)
+    if result["status"] in ("enqueued", "requeued"):
+        print(f"OK job_id={result['job_id']} run_key={result['run_key']}")
+    sys.exit(0)
 
 
 if __name__ == "__main__":
