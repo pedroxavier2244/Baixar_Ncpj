@@ -23,3 +23,12 @@ def test_index_defaults():
     assert s.index_min_free_gb == 50
     assert s.index_work_mem == "256MB"
     assert s.index_parallel_workers == 0
+
+
+def test_scheduler_defaults():
+    from config import Settings
+    s = Settings()
+    assert s.scheduler_enabled is True
+    assert s.scheduler_hour == 3
+    assert s.scheduler_tz == "America/Sao_Paulo"
+    assert s.scheduler_poll_seconds == 1800

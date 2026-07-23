@@ -59,6 +59,12 @@ class Settings(BaseSettings):
     index_work_mem: str = "256MB"     # work_mem da sessão durante o REFRESH
     index_parallel_workers: int = 0   # 0 = sem paralelismo — evita alocação de /dev/shm (64MB limite Docker)
 
+    # Scheduler — checagem automática diária da RF
+    scheduler_enabled: bool = True
+    scheduler_hour: int = 3                      # hora-alvo (0-23), no fuso scheduler_tz
+    scheduler_tz: str = "America/Sao_Paulo"
+    scheduler_poll_seconds: int = 1800           # 30 min entre polls
+
     # Postgres schemas (banco corporativo compartilhado — nunca usar "public")
     pg_schema: str = "cnpj"                  # dados finais tratados
     pg_staging_schema: str = "cnpj_staging"  # staging UNLOGGED (COPY rápido)
