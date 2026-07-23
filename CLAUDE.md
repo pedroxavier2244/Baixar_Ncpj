@@ -118,27 +118,27 @@ WHERE situacao_cadastral = '02' AND cnpj_ordem = '0001';
 
 ## Arquivos do projeto
 
+O codebase de produção fica na **raiz do repositório**. Não há subpasta de código.
+
 ```
-BANCO CNPJ/
-├── Baixar_Ncpj/            ← Codebase principal de produção
-│   ├── api/                ← FastAPI (routes/, main.py, schemas.py)
-│   ├── db/
-│   │   ├── schema.sql      ← Schema PostgreSQL (idempotente)
-│   │   ├── control.py      ← Fila de jobs SQLite
-│   │   └── migrations/     ← Scripts de migração numerados
-│   ├── steps/              ← 7 etapas do pipeline ETL
-│   ├── tests/              ← pytest (11 módulos)
-│   ├── config.py           ← Pydantic Settings (todas as variáveis)
-│   ├── orchestrator.py     ← Motor do pipeline (chama os 7 steps)
-│   ├── worker.py           ← Loop do job (produção)
-│   ├── enqueue_job.py      ← Detecta nova versão RF → cria job
-│   ├── docker-compose.yml  ← Stack de produção
-│   └── .env / .env.example
-├── db/schema.sql           ← Versão raiz (referência)
-└── config.py               ← Versão raiz (referência)
+BANCO CNPJ/                 ← raiz = codebase de produção
+├── api/                    ← FastAPI (routes/, main.py, schemas.py)
+├── db/
+│   ├── schema.sql          ← Schema PostgreSQL (idempotente)
+│   ├── control.py          ← Fila de jobs SQLite
+│   └── migrations/         ← Scripts de migração numerados
+├── steps/                  ← 7 etapas do pipeline ETL
+├── tests/                  ← pytest (11 módulos)
+├── docs/                   ← Documentação (API.md, docs de infra, planos)
+├── config.py               ← Pydantic Settings (todas as variáveis)
+├── orchestrator.py         ← Motor do pipeline (chama os 7 steps)
+├── worker.py               ← Loop do job (produção)
+├── enqueue_job.py          ← Detecta nova versão RF → cria job
+├── docker-compose.yml      ← Stack de produção
+└── .env.example            ← Template (o .env real nunca é commitado)
 ```
 
-**Atenção:** Existem arquivos duplicados na raiz e em `Baixar_Ncpj/`. O codebase **ativo em produção** é sempre `Baixar_Ncpj/`. Antes de editar qualquer arquivo, confirmar qual versão é a correta.
+**Histórico:** até 2026-07 existia uma pasta `Baixar_Ncpj/` registrada como submodule apontando para o próprio repositório. O código era idêntico ao da raiz e a pasta chegava vazia em clones novos (faltava `.gitmodules`). O gitlink foi removido e a pasta está no `.gitignore`. Se ela existir na sua máquina, é resquício local — ignore e trabalhe na raiz.
 
 ---
 
@@ -180,7 +180,7 @@ curl http://localhost:8001/health
 
 ## Variáveis de ambiente obrigatórias
 
-Ver `.env.example` em `Baixar_Ncpj/`. Principais:
+Ver `.env.example` na raiz do projeto. Principais:
 
 | Variável | Descrição |
 |---|---|

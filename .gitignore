@@ -2,6 +2,8 @@
 !.env.example
 .venv/
 venv/
+# resquicio local do antigo submodule auto-referente — nao versionar
+Baixar_Ncpj/
 __pycache__/
 *.pyc
 *.pyo
