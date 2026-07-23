@@ -1,6 +1,5 @@
 """
-Cleanup step — remove raw ZIPs and intermediate CSVs, write ultimo_status.json.
-Keeps the transformed CSVs for audit/reprocessing.
+Cleanup step — remove raw ZIPs, intermediate CSVs, and transformed CSVs, write ultimo_status.json.
 """
 from __future__ import annotations
 
@@ -38,14 +37,23 @@ def run(job_id: str, run_key: str, checkpoint_dir: Path) -> StepResult:
     removed += _remove_glob(data_dir, "*.zip")
     removed += _remove_glob(data_dir, "*.part")
 
-    # Remove intermediate (pre-transform) CSVs — keep transformed/ subdir
+    # Remove intermediate (pre-transform) CSVs
     csv_dir = data_dir / "csv"
     removed += _remove_glob(csv_dir, "*")
     if csv_dir.exists():
         try:
-            csv_dir.rmdir()  # remove dir only if now empty
+            csv_dir.rmdir()
         except OSError:
-            pass  # not empty — that's fine
+            pass
+
+    # Remove transformed CSVs — already loaded into DB at this point
+    transformed_dir = data_dir / "transformed"
+    removed += _remove_glob(transformed_dir, "*")
+    if transformed_dir.exists():
+        try:
+            transformed_dir.rmdir()
+        except OSError:
+            pass
 
     log.info(f"removed {removed} temp files from {data_dir}")
 
