@@ -72,6 +72,27 @@ services:
       redis:
         condition: service_healthy
 
+  # ── Scheduler — dispara a checagem diária da RF ──────────────────────────────
+  scheduler:
+    build: .
+    container_name: cnpj_scheduler
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATA_DIR: "/data"
+      LOG_DIR: "/logs"
+      CHECKPOINT_DIR: "/checkpoints"
+      CONTROL_DB: "/checkpoints/pipeline_control.db"
+      STATUS_FILE: "/data/ultimo_status.json"
+      TZ: "America/Sao_Paulo"
+    command: ["python", "scheduler.py"]
+    volumes:
+      - etl_data:/data
+      - etl_logs:/logs
+      - etl_checkpoints:/checkpoints
+    networks:
+      - cnpj_net
+
   # ── Redis Cache ─────────────────────────────────────────────────────────────
   redis:
     image: redis:7-alpine

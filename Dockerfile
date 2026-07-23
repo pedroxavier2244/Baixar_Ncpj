@@ -26,7 +26,7 @@ COPY api/        ./api/
 COPY steps/      ./steps/
 COPY db/         ./db/
 COPY config.py   logger.py orchestrator.py worker.py \
-     enqueue_job.py setup.py ./
+     enqueue_job.py scheduler.py setup.py ./
 
 # Diretórios de runtime — serão montados como volumes no docker-compose
 RUN mkdir -p /data /logs /checkpoints
