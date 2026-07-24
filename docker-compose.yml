@@ -71,6 +71,10 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+    # O HEALTHCHECK do Dockerfile testa a API em localhost:8000 — o worker não
+    # sobe servidor HTTP, então o container ficaria unhealthy permanentemente.
+    healthcheck:
+      disable: true
 
   # ── Scheduler — dispara a checagem diária da RF ──────────────────────────────
   scheduler:
@@ -92,6 +96,9 @@ services:
       - etl_checkpoints:/checkpoints
     networks:
       - cnpj_net
+    # Mesmo motivo do worker: não expõe HTTP, o healthcheck da imagem não se aplica.
+    healthcheck:
+      disable: true
 
   # ── Redis Cache ─────────────────────────────────────────────────────────────
   redis:
