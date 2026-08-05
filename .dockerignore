@@ -1,0 +1,30 @@
+# Ambiente virtual local
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Dados e logs locais — montados como volumes no Docker
+data/
+logs/
+checkpoints/
+
+# Testes — não vão para produção
+tests/
+
+# Docs
+docs/
+
+# Git
+.git/
+.gitignore
+
+# Configs locais
+.env
+*.bat
+scheduler/
+
+# Temporários
+*.tmp
+*.part

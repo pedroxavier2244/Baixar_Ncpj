@@ -1,0 +1,138 @@
+version: "3.9"
+
+# ── Redes ─────────────────────────────────────────────────────────────────────
+networks:
+  cnpj_net:
+    driver: bridge
+  # Rede do Postgres já existente na VPS — referenciada como externa
+  implementation_default:
+    external: true
+
+# ── Volumes persistentes (sobrevivem a restarts e rebuilds) ──────────────────
+volumes:
+  redis_data:
+  etl_data:          # ZIPs, CSVs transformados, ultimo_status.json
+  etl_logs:          # logs do worker e da API
+  etl_checkpoints:   # SQLite control.db + manifests de checkpoint
+
+services:
+
+  # ── API FastAPI ─────────────────────────────────────────────────────────────
+  api:
+    build: .
+    container_name: cnpj_api
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      REDIS_URL: "redis://redis:6379/0"
+      DATA_DIR: "/data"
+      LOG_DIR: "/logs"
+      STATUS_FILE: "/data/ultimo_status.json"
+    ports:
+      - "127.0.0.1:8001:8000"    # expõe só para o nginx local, não para a internet
+    volumes:
+      - etl_data:/data
+      - etl_logs:/logs
+    networks:
+      - cnpj_net
+      - implementation_default
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 25s
+
+  # ── Worker ETL ──────────────────────────────────────────────────────────────
+  worker:
+    build: .
+    container_name: cnpj_worker
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      REDIS_URL: "redis://redis:6379/0"
+      DATA_DIR: "/data"
+      LOG_DIR: "/logs"
+      CHECKPOINT_DIR: "/checkpoints"
+      CONTROL_DB: "/checkpoints/pipeline_control.db"
+      STATUS_FILE: "/data/ultimo_status.json"
+    command: ["python", "worker.py"]
+    volumes:
+      - etl_data:/data
+      - etl_logs:/logs
+      - etl_checkpoints:/checkpoints
+    networks:
+      - cnpj_net
+      - implementation_default
+    depends_on:
+      redis:
+        condition: service_healthy
+    # O HEALTHCHECK do Dockerfile testa a API em localhost:8000 — o worker não
+    # sobe servidor HTTP, então o container ficaria unhealthy permanentemente.
+    healthcheck:
+      disable: true
+
+  # ── Scheduler — dispara a checagem diária da RF ──────────────────────────────
+  scheduler:
+    build: .
+    container_name: cnpj_scheduler
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATA_DIR: "/data"
+      LOG_DIR: "/logs"
+      CHECKPOINT_DIR: "/checkpoints"
+      CONTROL_DB: "/checkpoints/pipeline_control.db"
+      STATUS_FILE: "/data/ultimo_status.json"
+      TZ: "America/Sao_Paulo"
+    command: ["python", "scheduler.py"]
+    volumes:
+      - etl_data:/data
+      - etl_logs:/logs
+      - etl_checkpoints:/checkpoints
+    networks:
+      - cnpj_net
+    # Mesmo motivo do worker: não expõe HTTP, o healthcheck da imagem não se aplica.
+    healthcheck:
+      disable: true
+
+  # ── Redis Cache ─────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: cnpj_redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --save ""
+    volumes:
+      - redis_data:/data
+    networks:
+      - cnpj_net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ── Nginx — proxy reverso HTTP ───────────────────────────────────────────────
+  # Sem domínio: recebe na porta 80, roteia para a API na 8000.
+  # Para adicionar HTTPS no futuro: substituir este bloco pelo nginx + certbot.
+  nginx:
+    image: nginx:alpine
+    container_name: cnpj_nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    networks:
+      - cnpj_net
+    depends_on:
+      api:
+        condition: service_healthy

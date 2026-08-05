@@ -1,21 +1,28 @@
 """
-Load step — incremental merge via staging tables.
+Load step — schema swap strategy.
 
-Para empresas e estabelecimentos:
-  1. TRUNCATE staging
-  2. COPY dump completo -> staging  (rapido: UNLOGGED, sem indices de dados, sem constraints)
-  3. INSERT novas linhas (presentes em staging, ausentes em main)
-  4. UPDATE linhas alteradas (PK bate mas dados diferem)
-  5. DELETE linhas removidas pela RF (presentes em main, ausentes em staging)
-     — protegido por _check_staging_volume para evitar exclusao massiva acidental
+Para cada tabela principal (empresas, estabelecimentos, socios, simples):
+  1. DROP TABLE <nome>_old CASCADE  (tabelas antigas do run anterior + deps obsoletas do MV)
+  2. CREATE TABLE <nome>_new        (mesma DDL, com run_key/created_at como DEFAULT)
+  3. COPY CSV direto para <nome>_new (sem índices ainda = máxima velocidade)
+  4. CREATE INDEX em <nome>_new     (após carga = muito mais rápido)
+  5. Swap atômico (milissegundos):
+       ALTER TABLE <nome>     RENAME TO <nome>_old
+       ALTER TABLE <nome>_new RENAME TO <nome>
+  6. <nome>_old permanece até o index_step recriar o MV e fazer o DROP final
 
-Para socios e simples: sem PK natural estavel -> TRUNCATE main + INSERT from staging.
-Para lookup tables (cnaes, municipios, ...): TRUNCATE + COPY (pequenas, rapidas).
+Para lookup tables (cnaes, municipios, etc.): TRUNCATE + COPY (pequenas, rápidas).
+
+Vantagens vs diff-merge incremental:
+  - Sem UPDATE/DELETE em tabelas live → sem bloat MVCC
+  - Tabela live intocada durante build → zero impacto em queries
+  - Swap atômico (metadados apenas, < 1ms)
+  - Rollback em falha: _new simplesmente não é promovida
+  - MV recriada no index_step após swap (deps frescas)
 """
 from __future__ import annotations
 
 import csv
-import json
 from pathlib import Path
 
 import psycopg
@@ -28,17 +35,14 @@ log = get_logger("step.load")
 
 # ── Schemas ────────────────────────────────────────────────────────────────
 _D = settings.pg_schema          # "cnpj"         — dados finais
-_S = settings.pg_staging_schema  # "cnpj_staging" — tabelas UNLOGGED
+_S = settings.pg_staging_schema  # "cnpj_staging" — não usado no swap, mantido por compatibilidade
 
-# ── Definicao de colunas ──────────────────────────────────────────────────
-# Deve corresponder exatamente ao header do CSV transformado.
-
+# ── Definição de colunas (apenas dados — sem run_key/created_at/updated_at) ──
 _EMPRESAS_COLS: list[str] = [
     "cnpj_basico", "razao_social", "natureza_juridica",
     "qualificacao_responsavel", "capital_social", "porte",
     "ente_federativo_responsavel",
 ]
-_EMPRESAS_PK: list[str] = ["cnpj_basico"]
 
 _ESTAB_COLS: list[str] = [
     "cnpj_basico", "cnpj_ordem", "cnpj_dv",
@@ -51,7 +55,6 @@ _ESTAB_COLS: list[str] = [
     "ddd1", "telefone1", "ddd2", "telefone2", "ddd_fax", "fax",
     "correio_eletronico", "situacao_especial", "data_situacao_especial",
 ]
-_ESTAB_PK: list[str] = ["cnpj_basico", "cnpj_ordem", "cnpj_dv"]
 
 _SOCIOS_COLS: list[str] = [
     "cnpj_basico", "identificador_socio", "nome_socio", "cnpj_cpf_socio",
@@ -76,8 +79,117 @@ LOOKUP_TABLE_MAP: dict[str, str] = {
     "portes":        f"{_D}.rf_portes",
 }
 
+# Tabelas principais que participam do swap
+_MAIN_TABLES = [
+    f"{_D}.rf_empresas",
+    f"{_D}.rf_estabelecimentos",
+    f"{_D}.rf_socios",
+    f"{_D}.rf_simples",
+]
 
-# ── Helpers de baixo nivel ─────────────────────────────────────────────────
+
+# ── DDL das tabelas _new ────────────────────────────────────────────────────
+# run_key e timestamps definidos como DEFAULT → preenchidos automaticamente
+# pelo COPY sem precisar de UPDATE posterior (muito mais rápido em 60M linhas).
+
+# NOTA: a PRIMARY KEY NÃO é declarada inline. Os dados da RF ocasionalmente
+# trazem o mesmo cnpj_basico duas vezes (registro real + stub vazio); por isso
+# o COPY entra sem PK, deduplica-se (mantendo a linha mais completa) e só então
+# o load adiciona a PK. Ver _dedup_in_place / _build_new_table(pk_cols=...).
+def _empresas_new_ddl(run_key: str) -> str:
+    return f"""
+CREATE UNLOGGED TABLE {_D}.rf_empresas_new (
+    cnpj_basico                  CHAR(8)     NOT NULL,
+    razao_social                 TEXT,
+    natureza_juridica            CHAR(4),
+    qualificacao_responsavel     CHAR(2),
+    capital_social               TEXT,
+    porte                        CHAR(2),
+    ente_federativo_responsavel  TEXT,
+    run_key                      CHAR(7)     DEFAULT '{run_key}',
+    created_at                   TIMESTAMPTZ DEFAULT NOW(),
+    updated_at                   TIMESTAMPTZ DEFAULT NOW()
+)"""
+
+
+def _estab_new_ddl(run_key: str) -> str:
+    return f"""
+CREATE UNLOGGED TABLE {_D}.rf_estabelecimentos_new (
+    cnpj_basico                  CHAR(8)     NOT NULL,
+    cnpj_ordem                   CHAR(4)     NOT NULL,
+    cnpj_dv                      CHAR(2)     NOT NULL,
+    identificador_matriz_filial  CHAR(1),
+    nome_fantasia                TEXT,
+    situacao_cadastral           CHAR(2),
+    data_situacao_cadastral      CHAR(8),
+    motivo_situacao_cadastral    CHAR(2),
+    nm_cidade_exterior           TEXT,
+    pais                         CHAR(3),
+    data_inicio_atividade        CHAR(8),
+    cnae_fiscal                  CHAR(7),
+    cnae_fiscal_secundaria       TEXT,
+    tipo_logradouro              TEXT,
+    logradouro                   TEXT,
+    numero                       TEXT,
+    complemento                  TEXT,
+    bairro                       TEXT,
+    cep                          CHAR(8),
+    uf                           CHAR(2),
+    municipio                    CHAR(7),
+    ddd1                         TEXT,
+    telefone1                    TEXT,
+    ddd2                         TEXT,
+    telefone2                    TEXT,
+    ddd_fax                      TEXT,
+    fax                          TEXT,
+    correio_eletronico           TEXT,
+    situacao_especial            TEXT,
+    data_situacao_especial       CHAR(8),
+    run_key                      CHAR(7)     DEFAULT '{run_key}',
+    created_at                   TIMESTAMPTZ DEFAULT NOW(),
+    updated_at                   TIMESTAMPTZ DEFAULT NOW()
+)"""  # PK composta adicionada após o dedup — ver _build_new_table(pk_cols=...)
+
+
+def _socios_new_ddl(run_key: str) -> str:
+    # id GENERATED ALWAYS AS IDENTITY: preenchido automaticamente durante COPY
+    # (id não está em _SOCIOS_COLS, então o COPY especifica apenas as colunas de dados)
+    return f"""
+CREATE UNLOGGED TABLE {_D}.rf_socios_new (
+    id                           BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    cnpj_basico                  CHAR(8),
+    identificador_socio          CHAR(1),
+    nome_socio                   TEXT,
+    cnpj_cpf_socio               TEXT,
+    qualificacao_socio           CHAR(2),
+    data_entrada_sociedade       CHAR(8),
+    pais                         CHAR(3),
+    representante_legal          TEXT,
+    nome_representante           TEXT,
+    qualificacao_representante   CHAR(2),
+    faixa_etaria                 CHAR(1),
+    run_key                      CHAR(7)     DEFAULT '{run_key}',
+    created_at                   TIMESTAMPTZ DEFAULT NOW(),
+    updated_at                   TIMESTAMPTZ DEFAULT NOW()
+)"""
+
+
+def _simples_new_ddl(run_key: str) -> str:
+    return f"""
+CREATE UNLOGGED TABLE {_D}.rf_simples_new (
+    cnpj_basico           CHAR(8)     NOT NULL,
+    opcao_pelo_simples    CHAR(1),
+    data_opcao_simples    CHAR(8),
+    data_exclusao_simples CHAR(8),
+    opcao_pelo_mei        CHAR(1),
+    data_opcao_mei        CHAR(8),
+    data_exclusao_mei     CHAR(8),
+    run_key               CHAR(7)     DEFAULT '{run_key}',
+    updated_at            TIMESTAMPTZ DEFAULT NOW()
+)"""  # PK adicionada após o dedup — ver _build_new_table(pk_cols=...)
+
+
+# ── Helpers de baixo nível ──────────────────────────────────────────────────
 
 def _read_header(csv_path: Path) -> list[str]:
     with open(csv_path, "r", encoding="utf-8", newline="") as f:
@@ -86,7 +198,7 @@ def _read_header(csv_path: Path) -> list[str]:
 
 def _copy_csv(conn: psycopg.Connection, table: str,
               csv_path: Path, columns: list[str]) -> int:
-    """Stream csv_path para table via COPY. Retorna contagem aproximada de linhas."""
+    """Streama csv_path para table via COPY. Retorna contagem aproximada de linhas."""
     col_sql = ", ".join(f'"{c}"' for c in columns)
     sql = f'COPY {table} ({col_sql}) FROM STDIN WITH (FORMAT csv, HEADER true)'
     rows = 0
@@ -94,161 +206,205 @@ def _copy_csv(conn: psycopg.Connection, table: str,
         with cur.copy(sql) as copy:
             with open(csv_path, "r", encoding="utf-8") as f:
                 while chunk := f.read(65536):
+                    chunk = chunk.replace('\x00', '')  # remove null bytes rejeitados pelo Postgres
                     copy.write(chunk)
                     rows += chunk.count("\n")
     return max(0, rows - 1)
 
 
-# ── Staging ────────────────────────────────────────────────────────────────
+# ── Limpeza de runs anteriores ──────────────────────────────────────────────
 
-def _stage(conn: psycopg.Connection, staging_table: str,
-           csv_path: Path, columns: list[str]) -> int:
-    """TRUNCATE staging e COPY o dump completo."""
+def _drop_previous_old_tables(conn: psycopg.Connection) -> None:
+    """
+    Remove as tabelas _old deixadas pelo swap do run anterior.
+    CASCADE é necessário porque o MV em cnpj_serving ainda pode ter
+    dependência de OID nas tabelas antigas — o index_step recria o MV.
+    """
+    dropped = []
+    for live in _MAIN_TABLES:
+        schema, tname = live.rsplit(".", 1)
+        old = f"{schema}.{tname}_old"
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM information_schema.tables "
+                "WHERE table_schema=%s AND table_name=%s",
+                (schema, f"{tname}_old"),
+            )
+            if cur.fetchone():
+                cur.execute(f"DROP TABLE {old} CASCADE")
+                dropped.append(old)
+    conn.commit()
+    if dropped:
+        log.info(f"dropped previous _old tables (CASCADE): {dropped}")
+    else:
+        log.info("no _old tables from previous run found")
+
+
+# ── Build + swap ────────────────────────────────────────────────────────────
+
+def _dedup_in_place(
+    conn: psycopg.Connection,
+    table: str,
+    key_cols: list[str],
+    data_cols: list[str],
+) -> int:
+    """
+    Remove duplicatas pela chave natural, mantendo a linha mais completa.
+
+    Os arquivos da RF ocasionalmente trazem o mesmo cnpj_basico duas vezes —
+    tipicamente um registro real + um stub vazio. Sem dedup, o ADD PRIMARY KEY
+    seguinte falharia com UniqueViolation.
+
+    Critério de desempate: mantém a linha com mais colunas de dados preenchidas
+    (não-nulas); em empate, a primeira fisicamente (menor ctid).
+    Retorna a quantidade de linhas removidas.
+    """
+    key_list = ", ".join(key_cols)
+    completeness = " + ".join(f"({c} IS NOT NULL)::int" for c in data_cols) or "0"
+    sql = f"""
+        DELETE FROM {table} t
+        USING (
+            SELECT ctid,
+                   row_number() OVER (
+                       PARTITION BY {key_list}
+                       ORDER BY ({completeness}) DESC, ctid
+                   ) AS rn
+            FROM {table}
+        ) d
+        WHERE t.ctid = d.ctid AND d.rn > 1
+    """
     with conn.cursor() as cur:
-        cur.execute(f"TRUNCATE {staging_table}")
-    count = _copy_csv(conn, staging_table, csv_path, columns)
-    log.info(f"staged ~{count:,} rows into {staging_table}")
+        cur.execute(sql)
+        removed = cur.rowcount
+    conn.commit()
+    if removed and removed > 0:
+        log.warning(
+            f"  {table}: {removed:,} linha(s) duplicada(s) por chave natural "
+            f"removida(s) (dado duplicado na fonte RF)"
+        )
+    return max(0, removed or 0)
+
+
+def _build_new_table(
+    conn: psycopg.Connection,
+    new_table: str,
+    create_ddl: str,
+    csv_path: Path,
+    columns: list[str],
+    index_sqls: list[str],
+    pk_cols: list[str] | None = None,
+) -> int:
+    """
+    Cria <nome>_new do zero, COPY do CSV, cria índices.
+    Retorna contagem aproximada de linhas.
+
+    Se pk_cols for informado, a tabela é criada SEM primary key inline; após o
+    COPY, deduplica-se pela chave natural (mantendo a linha mais completa) e só
+    então adiciona-se a PRIMARY KEY. Isso torna o load resiliente a cnpj_basico
+    duplicado na fonte da RF. Tabelas com PK sintética (socios) passam pk_cols=None.
+    """
+    # Remove tentativa anterior com falha
+    with conn.cursor() as cur:
+        cur.execute(f"DROP TABLE IF EXISTS {new_table}")
+    conn.commit()
+
+    log.info(f"creating {new_table}...")
+    with conn.cursor() as cur:
+        cur.execute(create_ddl)
+    conn.commit()
+
+    count = _copy_csv(conn, new_table, csv_path, columns)
+    conn.commit()
+    log.info(f"  {new_table}: ~{count:,} rows loaded")
+
+    # Dedup pela chave natural + ADD PRIMARY KEY (antes dos índices secundários).
+    if pk_cols:
+        data_cols = [c for c in columns if c not in pk_cols]
+        _dedup_in_place(conn, new_table, pk_cols, data_cols)
+        key_list = ", ".join(pk_cols)
+        with conn.cursor() as cur:
+            cur.execute(f"ALTER TABLE {new_table} ADD PRIMARY KEY ({key_list})")
+        conn.commit()
+        log.info(f"  {new_table}: PRIMARY KEY ({key_list}) criada após dedup")
+
+    # Índices secundários criados APÓS a carga = drasticamente mais rápido
+    # Drop pelo nome antes de criar — o swap renomeia a tabela mas mantém o nome do índice,
+    # então tentativas seguintes encontrariam o índice "órfão" na tabela live.
+    for idx_sql in index_sqls:
+        parts = idx_sql.split()
+        idx_name = parts[2]  # "CREATE INDEX idx_name ON ..."
+        schema, _ = new_table.rsplit(".", 1)
+        with conn.cursor() as cur:
+            cur.execute(f"DROP INDEX IF EXISTS {schema}.{idx_name}")
+        conn.commit()
+        with conn.cursor() as cur:
+            cur.execute(idx_sql)
+        conn.commit()
+    log.info(f"  {new_table}: indexes ready")
+
     return count
 
 
-# ── Volume guard ───────────────────────────────────────────────────────────
-
-def _check_staging_volume(conn: psycopg.Connection,
-                          staging_table: str, main_table: str,
-                          min_ratio: float = 0.5) -> None:
+def _swap_table(conn: psycopg.Connection, live_table: str) -> None:
     """
-    Aborta se staging tem menos que min_ratio * linhas do main.
-    Previne DELETE massivo acidental quando staging e parcial.
-    Ignorado quando main esta vazio (primeira carga).
+    Swap atômico: live → _old, _new → live.
+    Executa em uma única transação — operação de metadados, < 1ms.
+    A tabela live permanece disponível para queries durante todo o build.
     """
+    schema, tname = live_table.rsplit(".", 1)
     with conn.cursor() as cur:
-        cur.execute(f"SELECT COUNT(*) FROM {staging_table}")
-        staging_count = cur.fetchone()[0]
-        cur.execute(f"SELECT COUNT(*) FROM {main_table}")
-        main_count = cur.fetchone()[0]
-
-    if main_count > 0 and staging_count < main_count * min_ratio:
-        raise RuntimeError(
-            f"Volume check falhou: {staging_table} tem {staging_count:,} linhas "
-            f"mas {main_table} tem {main_count:,}. "
-            f"Staging < {int(min_ratio * 100)}% do main — abortando para evitar perda de dados."
-        )
-    log.info(f"volume check OK: staging={staging_count:,} main={main_count:,}")
+        cur.execute(f"ALTER TABLE {schema}.{tname}     RENAME TO {tname}_old")
+        cur.execute(f"ALTER TABLE {schema}.{tname}_new RENAME TO {tname}")
+    conn.commit()
+    log.info(f"swap OK: {live_table}  (_old mantida até index_step recriar MV)")
 
 
-# ── Diff / merge ───────────────────────────────────────────────────────────
+# ── Lookup ──────────────────────────────────────────────────────────────────
 
-def _diff_merge(conn: psycopg.Connection,
-                pg_table: str, staging_table: str,
-                pk_cols: list[str], data_cols: list[str],
-                run_key: str) -> dict[str, int]:
-    """
-    Diff de tres vias entre staging (dump novo) e main (DB atual):
-      - INSERT linhas em staging mas nao em main  -> novos registros
-      - UPDATE linhas com PK igual mas dados diferentes -> alterados
-      - DELETE linhas em main mas nao em staging  -> removidos pela RF
-    Retorna {"inserted": N, "updated": N, "deleted": N}.
-    """
-    _check_staging_volume(conn, staging_table, pg_table)
-
-    non_pk = [c for c in data_cols if c not in pk_cols]
-
-    pk_join    = " AND ".join(f"t.{c} = s.{c}" for c in pk_cols)
-    pk_sub_ts  = " AND ".join(f"s.{c} = t.{c}" for c in pk_cols)
-    pk_sub_st  = " AND ".join(f"t.{c} = s.{c}" for c in pk_cols)
-    pk_present = " AND ".join(
-        f"NULLIF(BTRIM(s.{c}::text), '') IS NOT NULL" for c in pk_cols
-    )
-
-    ins_cols = ", ".join(f'"{c}"' for c in data_cols)
-    ins_vals = ", ".join(f"s.{c}" for c in data_cols)
-    set_clause = ", ".join(f'"{c}" = s.{c}' for c in non_pk)
-    t_tuple = "(" + ", ".join(f"t.{c}" for c in non_pk) + ")"
-    s_tuple = "(" + ", ".join(f"s.{c}" for c in non_pk) + ")"
-
-    params = {"run_key": run_key}
-
-    with conn.cursor() as cur:
-        cur.execute(f"""
-            INSERT INTO {pg_table} ({ins_cols}, run_key, created_at, updated_at)
-            SELECT {ins_vals}, %(run_key)s, NOW(), NOW()
-            FROM {staging_table} s
-            WHERE ({pk_present})
-              AND NOT EXISTS (SELECT 1 FROM {pg_table} t WHERE {pk_sub_st})
-        """, params)
-        inserted = cur.rowcount
-
-    with conn.cursor() as cur:
-        cur.execute(f"""
-            UPDATE {pg_table} t
-            SET {set_clause}, run_key = %(run_key)s, updated_at = NOW()
-            FROM {staging_table} s
-            WHERE ({pk_present})
-              AND {pk_join}
-              AND {t_tuple} IS DISTINCT FROM {s_tuple}
-        """, params)
-        updated = cur.rowcount
-
-    with conn.cursor() as cur:
-        cur.execute(f"""
-            DELETE FROM {pg_table} t
-            WHERE NOT EXISTS (
-                SELECT 1 FROM {staging_table} s WHERE {pk_sub_ts}
-            )
-        """)
-        deleted = cur.rowcount
-
-    return {"inserted": inserted, "updated": updated, "deleted": deleted}
-
-
-# ── Replace strategies ─────────────────────────────────────────────────────
-
-def _replace_socios(conn: psycopg.Connection, run_key: str) -> int:
-    """Socios sem PK natural: TRUNCATE main + INSERT from staging."""
-    with conn.cursor() as cur:
-        cur.execute(f"TRUNCATE {_D}.rf_socios RESTART IDENTITY")
-
-    cols   = ", ".join(f'"{c}"' for c in _SOCIOS_COLS)
-    s_cols = ", ".join(f"s.{c}" for c in _SOCIOS_COLS)
-    with conn.cursor() as cur:
-        cur.execute(f"""
-            INSERT INTO {_D}.rf_socios ({cols}, run_key, created_at, updated_at)
-            SELECT {s_cols}, %(run_key)s, NOW(), NOW()
-            FROM {_S}.rf_socios s
-        """, {"run_key": run_key})
-        return cur.rowcount
-
-
-def _replace_simples(conn: psycopg.Connection, run_key: str) -> int:
-    """
-    Simples: TRUNCATE main + INSERT from staging.
-    RF republica o arquivo completo todo mes.
-    """
-    with conn.cursor() as cur:
-        cur.execute(f"TRUNCATE {_D}.rf_simples")
-
-    cols   = ", ".join(f'"{c}"' for c in _SIMPLES_COLS)
-    s_cols = ", ".join(f"s.{c}" for c in _SIMPLES_COLS)
-    with conn.cursor() as cur:
-        cur.execute(f"""
-            INSERT INTO {_D}.rf_simples ({cols}, run_key, updated_at)
-            SELECT {s_cols}, %(run_key)s, NOW()
-            FROM {_S}.rf_simples s
-            WHERE NULLIF(BTRIM(s.cnpj_basico), '') IS NOT NULL
-        """, {"run_key": run_key})
-        return cur.rowcount
-
-
-def _load_lookup(conn: psycopg.Connection,
-                 pg_table: str, csv_path: Path) -> int:
-    """TRUNCATE + COPY para tabelas de lookup pequenas."""
+def _load_lookup(conn: psycopg.Connection, pg_table: str, csv_path: Path) -> int:
+    """TRUNCATE + COPY para tabelas de domínio pequenas."""
     header = _read_header(csv_path)
     with conn.cursor() as cur:
         cur.execute(f"TRUNCATE {pg_table} RESTART IDENTITY CASCADE")
-    return _copy_csv(conn, pg_table, csv_path, header)
+    count = _copy_csv(conn, pg_table, csv_path, header)
+    conn.commit()
+    return count
 
 
-# ── Step principal ─────────────────────────────────────────────────────────
+# ── Limpeza pós-swap ────────────────────────────────────────────────────────
+
+def _cleanup_etl_files(run_key: str) -> None:
+    """
+    Remove ZIPs e CSVs intermediários do run atual após o swap bem-sucedido.
+    Mantém o subdiretório transformed/ (auditoria).
+    Erros são não-fatais — logados como WARNING.
+    """
+    data_dir = settings.data_dir / run_key
+    removed = 0
+    for pattern in ("*.zip", "*.part"):
+        for p in data_dir.glob(pattern):
+            try:
+                p.unlink()
+                removed += 1
+            except Exception as exc:
+                log.warning(f"could not remove {p}: {exc}")
+    csv_dir = data_dir / "csv"
+    if csv_dir.exists():
+        for p in csv_dir.glob("*"):
+            try:
+                p.unlink()
+                removed += 1
+            except Exception as exc:
+                log.warning(f"could not remove {p}: {exc}")
+        try:
+            csv_dir.rmdir()
+        except OSError:
+            pass
+    if removed:
+        log.info(f"[post-swap cleanup] removed {removed} temp files from {data_dir}")
+
+
+# ── Step principal ──────────────────────────────────────────────────────────
 
 def run(job_id: str, run_key: str, checkpoint_dir: Path) -> StepResult:
     try:
@@ -261,68 +417,94 @@ def run(job_id: str, run_key: str, checkpoint_dir: Path) -> StepResult:
 
     try:
         with psycopg.connect(settings.postgres_url, autocommit=False) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SET work_mem = '32MB'")
+                cur.execute("SET maintenance_work_mem = '256MB'")
+            conn.commit()
+
+            # Passo 0: limpar _old do run anterior (CASCADE remove MV obsoleta)
+            _drop_previous_old_tables(conn)
+
             for table_entry in manifest.get("tables", []):
                 keyword = table_entry["keyword"]
                 tbl_key = keyword.lower()
                 csv_path = out_dir / f"{tbl_key}.csv"
 
                 if not csv_path.exists():
-                    log.warning(f"CSV transformado nao encontrado: {csv_path} — pulando")
+                    log.warning(f"CSV transformado não encontrado: {csv_path} — pulando")
                     continue
 
                 if tbl_key == "empresas":
-                    _stage(conn, f"{_S}.rf_empresas", csv_path, _EMPRESAS_COLS)
-                    diff = _diff_merge(
+                    # Sem índice secundário: a PRIMARY KEY (cnpj_basico) já indexa a chave.
+                    count = _build_new_table(
                         conn,
-                        f"{_D}.rf_empresas", f"{_S}.rf_empresas",
-                        _EMPRESAS_PK, _EMPRESAS_COLS, run_key,
+                        new_table=f"{_D}.rf_empresas_new",
+                        create_ddl=_empresas_new_ddl(run_key),
+                        csv_path=csv_path,
+                        columns=_EMPRESAS_COLS,
+                        index_sqls=[],
+                        pk_cols=["cnpj_basico"],
                     )
-                    conn.commit()
-                    log.info(
-                        f"rf_empresas — inserted {diff['inserted']:,}, "
-                        f"updated {diff['updated']:,}, deleted {diff['deleted']:,}"
-                    )
-                    results.append({"table": f"{_D}.rf_empresas", **diff})
+                    _swap_table(conn, f"{_D}.rf_empresas")
+                    results.append({"table": f"{_D}.rf_empresas", "inserted": count})
+                    log.info(f"rf_empresas swapped — {count:,} rows")
 
                 elif tbl_key == "estabelecimentos":
-                    _stage(conn, f"{_S}.rf_estabelecimentos", csv_path, _ESTAB_COLS)
-                    diff = _diff_merge(
+                    # A PK composta já indexa (cnpj_basico, cnpj_ordem, cnpj_dv);
+                    # mantém-se apenas o índice por cnpj_basico isolado (lookups por raiz).
+                    count = _build_new_table(
                         conn,
-                        f"{_D}.rf_estabelecimentos", f"{_S}.rf_estabelecimentos",
-                        _ESTAB_PK, _ESTAB_COLS, run_key,
+                        new_table=f"{_D}.rf_estabelecimentos_new",
+                        create_ddl=_estab_new_ddl(run_key),
+                        csv_path=csv_path,
+                        columns=_ESTAB_COLS,
+                        index_sqls=[
+                            f"CREATE INDEX idx_rf_estab_new_cnpj_basico "
+                            f"ON {_D}.rf_estabelecimentos_new (cnpj_basico)",
+                        ],
+                        pk_cols=["cnpj_basico", "cnpj_ordem", "cnpj_dv"],
                     )
-                    conn.commit()
-                    log.info(
-                        f"rf_estabelecimentos — inserted {diff['inserted']:,}, "
-                        f"updated {diff['updated']:,}, deleted {diff['deleted']:,}"
-                    )
-                    results.append({"table": f"{_D}.rf_estabelecimentos", **diff})
+                    _swap_table(conn, f"{_D}.rf_estabelecimentos")
+                    results.append({"table": f"{_D}.rf_estabelecimentos", "inserted": count})
+                    log.info(f"rf_estabelecimentos swapped — {count:,} rows")
 
                 elif tbl_key == "socios":
-                    _stage(conn, f"{_S}.rf_socios", csv_path, _SOCIOS_COLS)
-                    count = _replace_socios(conn, run_key)
-                    conn.commit()
-                    log.info(f"rf_socios — replaced with {count:,} rows")
-                    results.append({
-                        "table": f"{_D}.rf_socios",
-                        "inserted": count, "updated": 0, "deleted": 0,
-                    })
+                    # id (GENERATED ALWAYS AS IDENTITY) é preenchido automaticamente
+                    # durante COPY porque não está listado em _SOCIOS_COLS
+                    count = _build_new_table(
+                        conn,
+                        new_table=f"{_D}.rf_socios_new",
+                        create_ddl=_socios_new_ddl(run_key),
+                        csv_path=csv_path,
+                        columns=_SOCIOS_COLS,
+                        index_sqls=[
+                            f"CREATE INDEX idx_rf_socios_new_cnpj_basico "
+                            f"ON {_D}.rf_socios_new (cnpj_basico)",
+                        ],
+                    )
+                    _swap_table(conn, f"{_D}.rf_socios")
+                    results.append({"table": f"{_D}.rf_socios", "inserted": count})
+                    log.info(f"rf_socios swapped — {count:,} rows")
 
                 elif tbl_key == "simples":
-                    _stage(conn, f"{_S}.rf_simples", csv_path, _SIMPLES_COLS)
-                    count = _replace_simples(conn, run_key)
-                    conn.commit()
-                    log.info(f"rf_simples — replaced with {count:,} rows")
-                    results.append({
-                        "table": f"{_D}.rf_simples",
-                        "inserted": count, "updated": 0, "deleted": 0,
-                    })
+                    # Sem índice secundário: a PRIMARY KEY (cnpj_basico) já indexa a chave.
+                    count = _build_new_table(
+                        conn,
+                        new_table=f"{_D}.rf_simples_new",
+                        create_ddl=_simples_new_ddl(run_key),
+                        csv_path=csv_path,
+                        columns=_SIMPLES_COLS,
+                        index_sqls=[],
+                        pk_cols=["cnpj_basico"],
+                    )
+                    _swap_table(conn, f"{_D}.rf_simples")
+                    results.append({"table": f"{_D}.rf_simples", "inserted": count})
+                    log.info(f"rf_simples swapped — {count:,} rows")
 
                 elif tbl_key in LOOKUP_TABLE_MAP:
                     pg_table = LOOKUP_TABLE_MAP[tbl_key]
                     count = _load_lookup(conn, pg_table, csv_path)
-                    conn.commit()
-                    log.info(f"{pg_table} — loaded {count:,} rows")
+                    log.info(f"{pg_table} — {count:,} rows loaded")
                     results.append({"table": pg_table, "inserted": count})
 
                 else:
@@ -332,19 +514,12 @@ def run(job_id: str, run_key: str, checkpoint_dir: Path) -> StepResult:
         import traceback
         return StepResult.failed(f"load failed: {exc}\n{traceback.format_exc()}")
 
+    # Libera espaço em disco antes do index_step
+    _cleanup_etl_files(run_key)
+
     artifact = checkpoint_dir / "load_manifest.json"
     write_artifact(artifact, {"run_key": run_key, "tables": results})
 
-    total_inserted = sum(r.get("inserted", 0) for r in results)
-    total_updated  = sum(r.get("updated",  0) for r in results)
-    total_deleted  = sum(r.get("deleted",  0) for r in results)
-    log.info(
-        f"load complete — inserted {total_inserted:,}, "
-        f"updated {total_updated:,}, deleted {total_deleted:,}"
-    )
-    return StepResult.success(
-        artifact_path=artifact,
-        inserted=total_inserted,
-        updated=total_updated,
-        deleted=total_deleted,
-    )
+    total = sum(r.get("inserted", 0) for r in results)
+    log.info(f"load complete — {total:,} rows across {len(results)} tables")
+    return StepResult.success(artifact_path=artifact, inserted=total, updated=0, deleted=0)

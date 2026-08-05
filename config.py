@@ -33,8 +33,37 @@ class Settings(BaseSettings):
     api_host: str = "0.0.0.0"
     api_port: int = 8000
     api_workers: int = 8
-    db_pool_min: int = 5
-    db_pool_max: int = 20
+    db_pool_min: int = 10
+    db_pool_max: int = 50
+    db_pool_timeout: float = 10.0   # segundos para desistir de esperar conexão do pool
+
+    # Cache
+    redis_url: str = "redis://localhost:6379/0"
+    cache_ttl: int = 2592000        # 30 dias — lookup de CNPJ individual
+    cache_stale_ttl: int = 7776000  # 90 dias — fallback stale quando banco falha
+    search_cache_ttl: int = 300     # 5min — resultados de busca
+
+    # Rate limiting (requisições por minuto por IP)
+    rate_limit_cnpj: str = "2000/minute"
+    rate_limit_search: str = "1000/minute"
+
+    # Segurança — API Key enviada pelo CRM no header X-API-Key
+    # Deixe vazio para desabilitar (desenvolvimento)
+    api_key: str = ""
+
+    # Timeout de query no banco (ms) — evita query lenta travar o pool
+    db_query_timeout_ms: int = 8000
+
+    # Index step — disk safety and performance
+    index_min_free_gb: int = 50       # mínimo de espaço livre antes do REFRESH CONCURRENTLY
+    index_work_mem: str = "256MB"     # work_mem da sessão durante o REFRESH
+    index_parallel_workers: int = 0   # 0 = sem paralelismo — evita alocação de /dev/shm (64MB limite Docker)
+
+    # Scheduler — checagem automática diária da RF
+    scheduler_enabled: bool = True
+    scheduler_hour: int = 3                      # hora-alvo (0-23), no fuso scheduler_tz
+    scheduler_tz: str = "America/Sao_Paulo"
+    scheduler_poll_seconds: int = 1800           # 30 min entre polls
 
     # Postgres schemas (banco corporativo compartilhado — nunca usar "public")
     pg_schema: str = "cnpj"                  # dados finais tratados
