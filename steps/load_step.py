@@ -480,6 +480,21 @@ def run(job_id: str, run_key: str, checkpoint_dir: Path) -> StepResult:
                         index_sqls=[
                             f"CREATE INDEX idx_rf_socios_new_cnpj_basico "
                             f"ON {_D}.rf_socios_new (cnpj_basico)",
+                            # Busca reversa (pessoa -> empresas), que o /socios/buscar faz:
+                            # filtra por (cnpj_cpf_socio, nome_socio). Sem este indice o
+                            # Postgres varre as 28M linhas em seq scan — 3,1s medidos na VPS,
+                            # contra statement_timeout de 8s da API: passa hoje e estoura
+                            # assim que o banco pega carga.
+                            #
+                            # Ele JA tinha sido criado pela migration 006, mas a mao e na
+                            # tabela viva — e e exatamente isso que o swap mensal desfaz:
+                            # quem sobrevive ao rename e o indice criado aqui, na _new. Por
+                            # isso foi encontrado AUSENTE em 24/08/2026 (run_key 2026-08),
+                            # com a migration 006 versionada e aparentemente aplicada.
+                            # Mesma armadilha do cabecalho da migration 008 para colunas:
+                            # o que nao passa por index_sqls nao sobrevive a carga.
+                            f"CREATE INDEX idx_rf_socios_new_cpf_nome "
+                            f"ON {_D}.rf_socios_new (cnpj_cpf_socio, nome_socio)",
                         ],
                     )
                     _swap_table(conn, f"{_D}.rf_socios")
