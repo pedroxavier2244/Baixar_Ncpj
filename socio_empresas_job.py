@@ -48,6 +48,18 @@ log = get_logger("socio_empresas_job")
 _INDICE_REVERSO = "idx_rf_socios_new_cpf_nome"
 _PAGINA_SUPABASE = 1000
 
+# Advisory lock: impede duas execucoes simultaneas. Numero arbitrario e estavel —
+# so precisa nao colidir com outro advisory lock deste banco.
+#
+# Nasceu de um caso real (25/08/2026): ao subir o container as 10:52, o loop dele
+# viu que a janela das 4h ja tinha passado e disparou sozinho; um `--agora` manual
+# entrou 13s depois e as duas rodaram juntas. Nao corrompeu — o TRUNCATE serializa
+# e calcular_lote e idempotente — mas foram 110s de trabalho duplicado no banco.
+#
+# O lock e de SESSAO: se o processo morrer, o Postgres solta sozinho quando a
+# conexao cai. Nao ha risco de ficar travado para sempre.
+_LOCK_JOB = 825_0824
+
 
 # ── Lista de CNPJs (lado CRM) ───────────────────────────────────────────────
 
@@ -176,6 +188,18 @@ def gravar_controle(conn: psycopg.Connection, chave: str, valor: str) -> None:
         )
 
 
+def travar(conn: psycopg.Connection) -> bool:
+    """True se conseguiu o lock. False = ja tem outra execucao rodando."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_try_advisory_lock(%s)", (_LOCK_JOB,))
+        return cur.fetchone()[0]
+
+
+def destravar(conn: psycopg.Connection) -> None:
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_advisory_unlock(%s)", (_LOCK_JOB,))
+
+
 def sincronizar_base(conn: psycopg.Connection, cnpjs: list[str]) -> int:
     """
     Espelha a carteira em socio.base_cnpj — é contra ela que irmas_na_base conta.
@@ -254,84 +278,100 @@ def rodar(dry_run: bool = False) -> dict:
     # com lote fechado, uma falha custa só o lote corrente. Também mantém as
     # travas em rf_socios curtas, para não fazer o swap da carga esperar.
     with psycopg.connect(settings.postgres_url, autocommit=True) as conn:
-        # Antes de qualquer coisa: a carga da RF está rodando? Ver docstring de
-        # carga_rf_em_andamento — rodar junto degrada este job E atrasa a carga.
+        # Antes de tudo: mais alguem ja esta rodando? Ver comentario do _LOCK_JOB.
+        if not travar(conn):
+            log.warning(
+                "outra execução já está em andamento - saindo. "
+                "(o loop do container e uma execução manual disputando a mesma janela?)"
+            )
+            return {"status": "ja_rodando"}
+
+        try:
+            return _rodar_com_lock(conn, dry_run, inicio)
+        finally:
+            destravar(conn)
+
+
+def _rodar_com_lock(conn: psycopg.Connection, dry_run: bool, inicio: float) -> dict:
+    """Corpo de rodar(), já com o lock na mão e a conexão aberta."""
+    # Antes de qualquer coisa: a carga da RF está rodando? Ver docstring de
+    # carga_rf_em_andamento — rodar junto degrada este job E atrasa a carga.
+    if carga_rf_em_andamento(conn):
+        log.warning(
+            "carga da RF em andamento (tabelas _new existem) - adiado. "
+            "Se isto se repetir por dias, pode ser _new órfã de uma carga "
+            "que falhou; conferir antes de assumir que a carga está viva."
+        )
+        return {"status": "adiado", "motivo": "carga_rf_em_andamento"}
+
+    conferir_indice(conn)
+
+    # Carga nova = todo o dado de sócio mudou de uma vez. As linhas foram
+    # calculadas há pouco e o p_dias=45 as consideraria frescas, deixando o
+    # dado novo de fora por mais de um mês. Quando o run_key muda, ignora a
+    # janela de frescor e recalcula tudo.
+    rk_agora = run_key_atual(conn)
+    rk_antes = ler_controle(conn, "ultimo_run_key")
+    recarga = bool(rk_agora and rk_agora != rk_antes)
+    dias = 0 if recarga else settings.socio_job_dias
+    if recarga:
+        log.info(
+            f"run_key mudou ({rk_antes or 'nenhum'} -> {rk_agora}): "
+            "carga nova da RF, recalculando a base inteira"
+        )
+
+    cnpjs = buscar_cnpjs_da_base()
+
+    if dry_run:
+        n_lotes = (len(cnpjs) + settings.socio_job_lote - 1) // settings.socio_job_lote
+        log.info(
+            f"[dry-run] {len(cnpjs):,} CNPJs em {n_lotes} lotes, "
+            f"p_dias={dias}{' (recálculo total)' if recarga else ''}"
+        )
+        return {"status": "dry_run", "cnpjs": len(cnpjs),
+                "lotes": n_lotes, "dias": dias, "recarga": recarga}
+
+    # ANTES dos lotes: calcular_lote conta irmas_na_base contra base_cnpj,
+    # entao a carteira precisa estar espelhada quando o primeiro lote rodar.
+    sincronizar_base(conn, cnpjs)
+
+    total = 0
+    falhas = 0
+    lotes = [
+        cnpjs[i:i + settings.socio_job_lote]
+        for i in range(0, len(cnpjs), settings.socio_job_lote)
+    ]
+    for n, lote in enumerate(lotes, 1):
+        # Recheca a cada lote: a carga pode começar no meio da execução.
+        # Sair aqui deixa o que já foi commitado de pé e o fetch_log mostra
+        # até onde chegou — nada se perde, a próxima noite continua.
         if carga_rf_em_andamento(conn):
             log.warning(
-                "carga da RF em andamento (tabelas _new existem) - adiado. "
-                "Se isto se repetir por dias, pode ser _new órfã de uma carga "
-                "que falhou; conferir antes de assumir que a carga está viva."
+                f"carga da RF começou durante a execução - parando no lote "
+                f"{n}/{len(lotes)} ({total:,} linhas já gravadas)"
             )
-            return {"status": "adiado", "motivo": "carga_rf_em_andamento"}
+            falhas += 1
+            break
+        try:
+            total += processar_lote(conn, lote, dias)
+            log.info(f"lote {n}/{len(lotes)} — {total:,}/{len(cnpjs):,}")
+        except Exception as exc:
+            # Um lote ruim não derruba a noite inteira: o que já entrou está
+            # commitado, e o fetch_log mostra quem ficou de fora.
+            falhas += 1
+            log.error(f"lote {n}/{len(lotes)} falhou: {exc}")
 
-        conferir_indice(conn)
+    # DEPOIS dos lotes: as linhas que o p_dias pulou nao passaram pelo
+    # calcular_lote e por isso nao viram a carteira de hoje. Esta passada
+    # corrige todas, e e barata — JOIN de 22k contra 22k, sem tocar rf_socios.
+    if not falhas:
+        recontar_irmas_na_base(conn)
 
-        # Carga nova = todo o dado de sócio mudou de uma vez. As linhas foram
-        # calculadas há pouco e o p_dias=45 as consideraria frescas, deixando o
-        # dado novo de fora por mais de um mês. Quando o run_key muda, ignora a
-        # janela de frescor e recalcula tudo.
-        rk_agora = run_key_atual(conn)
-        rk_antes = ler_controle(conn, "ultimo_run_key")
-        recarga = bool(rk_agora and rk_agora != rk_antes)
-        dias = 0 if recarga else settings.socio_job_dias
-        if recarga:
-            log.info(
-                f"run_key mudou ({rk_antes or 'nenhum'} -> {rk_agora}): "
-                "carga nova da RF, recalculando a base inteira"
-            )
-
-        cnpjs = buscar_cnpjs_da_base()
-
-        if dry_run:
-            n_lotes = (len(cnpjs) + settings.socio_job_lote - 1) // settings.socio_job_lote
-            log.info(
-                f"[dry-run] {len(cnpjs):,} CNPJs em {n_lotes} lotes, "
-                f"p_dias={dias}{' (recálculo total)' if recarga else ''}"
-            )
-            return {"status": "dry_run", "cnpjs": len(cnpjs),
-                    "lotes": n_lotes, "dias": dias, "recarga": recarga}
-
-        # ANTES dos lotes: calcular_lote conta irmas_na_base contra base_cnpj,
-        # entao a carteira precisa estar espelhada quando o primeiro lote rodar.
-        sincronizar_base(conn, cnpjs)
-
-        total = 0
-        falhas = 0
-        lotes = [
-            cnpjs[i:i + settings.socio_job_lote]
-            for i in range(0, len(cnpjs), settings.socio_job_lote)
-        ]
-        for n, lote in enumerate(lotes, 1):
-            # Recheca a cada lote: a carga pode começar no meio da execução.
-            # Sair aqui deixa o que já foi commitado de pé e o fetch_log mostra
-            # até onde chegou — nada se perde, a próxima noite continua.
-            if carga_rf_em_andamento(conn):
-                log.warning(
-                    f"carga da RF começou durante a execução - parando no lote "
-                    f"{n}/{len(lotes)} ({total:,} linhas já gravadas)"
-                )
-                falhas += 1
-                break
-            try:
-                total += processar_lote(conn, lote, dias)
-                log.info(f"lote {n}/{len(lotes)} — {total:,}/{len(cnpjs):,}")
-            except Exception as exc:
-                # Um lote ruim não derruba a noite inteira: o que já entrou está
-                # commitado, e o fetch_log mostra quem ficou de fora.
-                falhas += 1
-                log.error(f"lote {n}/{len(lotes)} falhou: {exc}")
-
-        # DEPOIS dos lotes: as linhas que o p_dias pulou nao passaram pelo
-        # calcular_lote e por isso nao viram a carteira de hoje. Esta passada
-        # corrige todas, e e barata — JOIN de 22k contra 22k, sem tocar rf_socios.
-        if not falhas:
-            recontar_irmas_na_base(conn)
-
-        # Só marca o run_key numa execução limpa. Marcar um recálculo pela metade
-        # faria o job achar que já absorveu a carga nova, e o resto ficaria velho
-        # em silêncio até a próxima carga.
-        if not falhas and rk_agora:
-            gravar_controle(conn, "ultimo_run_key", rk_agora)
+    # Só marca o run_key numa execução limpa. Marcar um recálculo pela metade
+    # faria o job achar que já absorveu a carga nova, e o resto ficaria velho
+    # em silêncio até a próxima carga.
+    if not falhas and rk_agora:
+        gravar_controle(conn, "ultimo_run_key", rk_agora)
 
     dur = time.monotonic() - inicio
     log.info(

@@ -30,6 +30,10 @@ with conn.cursor() as cur:
     cur.execute("CREATE TABLE socio.base_cnpj_bkp_teste AS SELECT * FROM socio.base_cnpj")
     cur.execute("SELECT count(*) FROM socio.base_cnpj_bkp_teste")
     BASE_ORIGINAL = cur.fetchone()[0]
+    # Nao cravar numero: a carteira cresce (22.141 -> 22.542 em um dia). O que
+    # o teste garante e que ele DEVOLVE o estado que encontrou, nao um valor fixo.
+    cur.execute("SELECT count(*) FROM socio.socio_empresas")
+    TOTAL_ORIGINAL = cur.fetchone()[0]
 print(f"base_cnpj salva para restaurar depois: {BASE_ORIGINAL:,} linhas")
 
 print("=" * 66)
@@ -194,7 +198,23 @@ with conn.cursor() as cur:
 
 print()
 print("=" * 66)
-print("8. deve_rodar — janela horaria")
+print("8. advisory lock — duas execucoes ao mesmo tempo")
+print("=" * 66)
+# Caso real de 25/08/2026: o loop do container disparou ao subir e um --agora
+# manual entrou 13s depois; as duas rodaram juntas por 110s.
+outra = psycopg.connect(settings.postgres_url, autocommit=True)
+checa("a 1a sessao pega o lock", J.travar(outra) is True)
+r = J.rodar()
+checa("a 2a desiste em vez de duplicar trabalho", r["status"] == "ja_rodando",
+      f"status={r['status']}")
+J.destravar(outra)
+r = J.rodar()
+checa("liberado o lock, volta a rodar", r["status"] == "ok", f"status={r['status']}")
+outra.close()
+
+print()
+print("=" * 66)
+print("9. deve_rodar — janela horaria")
 print("=" * 66)
 from datetime import datetime, date
 for nome, dt, h, ult, esp in [
@@ -222,8 +242,8 @@ with conn.cursor() as cur:
     base_voltou = cur.fetchone()[0]
     cur.execute("SELECT count(*) FROM socio.socio_empresas")
     total = cur.fetchone()[0]
-checa("schema de teste removido e carteira intacta (22141)", total == 22141,
-      f"total={total}")
+checa("schema de teste removido e carteira intacta", total == TOTAL_ORIGINAL,
+      f"total={total}, no inicio={TOTAL_ORIGINAL}")
 checa("base_cnpj restaurada ao estado original", base_voltou == BASE_ORIGINAL,
       f"voltou={base_voltou}, original={BASE_ORIGINAL}")
 
