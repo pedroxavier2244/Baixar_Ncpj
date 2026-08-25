@@ -22,6 +22,16 @@ def checa(nome, cond, detalhe=""):
 conn = psycopg.connect(settings.postgres_url, autocommit=True)
 SCHEMA_REAL = settings.pg_schema
 
+# sincronizar_base faz TRUNCATE, e este teste roda com 3 CNPJs — sem o snapshot
+# ele deixaria a base_cnpj REAL com 3 linhas, e todo irmas_na_base viraria zero
+# ate a proxima execucao noturna.
+with conn.cursor() as cur:
+    cur.execute("DROP TABLE IF EXISTS socio.base_cnpj_bkp_teste")
+    cur.execute("CREATE TABLE socio.base_cnpj_bkp_teste AS SELECT * FROM socio.base_cnpj")
+    cur.execute("SELECT count(*) FROM socio.base_cnpj_bkp_teste")
+    BASE_ORIGINAL = cur.fetchone()[0]
+print(f"base_cnpj salva para restaurar depois: {BASE_ORIGINAL:,} linhas")
+
 print("=" * 66)
 print("1. carga_rf_em_andamento — o caminho True (a protecao inteira)")
 print("=" * 66)
@@ -138,7 +148,53 @@ J.processar_lote = _orig
 
 print()
 print("=" * 66)
-print("6. deve_rodar — janela horaria")
+print("6. sincronizar_base — substitui, nao acumula")
+print("=" * 66)
+n = J.sincronizar_base(conn, ["11111111000111", "22222222000122"])
+checa("espelhou os 2 CNPJs", n == 2)
+n = J.sincronizar_base(conn, ["33333333000133"])
+checa("substituiu (nao somou): sobrou 1", n == 1,
+      "merge deixaria 3 — lead que saiu da carteira tem que sair da contagem")
+with conn.cursor() as cur:
+    cur.execute("SELECT cnpj, cnpj_basico FROM socio.base_cnpj")
+    linha = cur.fetchone()
+checa("cnpj_basico preenchido com os 8 primeiros digitos",
+      linha[1].strip() == linha[0].strip()[:8])
+
+print()
+print("=" * 66)
+print("7. recontar_irmas_na_base — cruza por 8 digitos, nao por CNPJ completo")
+print("=" * 66)
+# O caso que importa: a irma gravada e MATRIZ, e a carteira tem a FILIAL dela.
+with conn.cursor() as cur:
+    cur.execute(
+        "INSERT INTO socio.socio_empresas "
+        "(cnpj, n_empresas_dono, cnpjs_irmas, n_socios, n_socios_pf, atualizado_em) "
+        "VALUES ('99999999000199', 2, '88888888000100', 1, 1, NOW()) "
+        "ON CONFLICT (cnpj) DO UPDATE SET cnpjs_irmas = EXCLUDED.cnpjs_irmas, "
+        "n_empresas_dono = EXCLUDED.n_empresas_dono"
+    )
+J.sincronizar_base(conn, ["88888888000288"])   # filial 0288; a irma e a matriz 0100
+J.recontar_irmas_na_base(conn)
+with conn.cursor() as cur:
+    cur.execute("SELECT irmas_na_base FROM socio.socio_empresas WHERE cnpj='99999999000199'")
+    v = cur.fetchone()[0]
+checa("acha a irma mesmo a carteira tendo so a filial", v == 1,
+      f"irmas_na_base={v} — se der 0, o cruzamento voltou a ser por CNPJ completo")
+
+J.sincronizar_base(conn, ["77777777000177"])
+J.recontar_irmas_na_base(conn)
+with conn.cursor() as cur:
+    cur.execute("SELECT irmas_na_base FROM socio.socio_empresas WHERE cnpj='99999999000199'")
+    v = cur.fetchone()[0]
+checa("carteira sem a irma -> zero, nao nulo", v == 0, f"irmas_na_base={v}")
+
+with conn.cursor() as cur:
+    cur.execute("DELETE FROM socio.socio_empresas WHERE cnpj='99999999000199'")
+
+print()
+print("=" * 66)
+print("8. deve_rodar — janela horaria")
 print("=" * 66)
 from datetime import datetime, date
 for nome, dt, h, ult, esp in [
@@ -159,10 +215,26 @@ with conn.cursor() as cur:
     cur.execute("DELETE FROM socio.socio_empresas WHERE cnpj='11222333000181'")
     cur.execute("DELETE FROM socio.socio_empresas_fetch_log WHERE cnpj='11222333000181'")
     cur.execute("DELETE FROM socio.job_controle WHERE chave='ultimo_run_key'")
+    cur.execute("TRUNCATE socio.base_cnpj")
+    cur.execute("INSERT INTO socio.base_cnpj SELECT * FROM socio.base_cnpj_bkp_teste")
+    cur.execute("DROP TABLE socio.base_cnpj_bkp_teste")
+    cur.execute("SELECT count(*) FROM socio.base_cnpj")
+    base_voltou = cur.fetchone()[0]
     cur.execute("SELECT count(*) FROM socio.socio_empresas")
     total = cur.fetchone()[0]
 checa("schema de teste removido e carteira intacta (22141)", total == 22141,
       f"total={total}")
+checa("base_cnpj restaurada ao estado original", base_voltou == BASE_ORIGINAL,
+      f"voltou={base_voltou}, original={BASE_ORIGINAL}")
+
+# irmas_na_base ficou zerado pelos testes acima (rodaram com carteira falsa).
+# Recontar contra a base_cnpj ja restaurada devolve o numero de verdade.
+at, teto = J.recontar_irmas_na_base(conn)
+with conn.cursor() as cur:
+    cur.execute("SELECT count(*) FROM socio.socio_empresas WHERE irmas_na_base > 0")
+    com_irma = cur.fetchone()[0]
+checa("irmas_na_base reconciliado com a carteira real", com_irma > 0,
+      f"{com_irma} linha(s) com irma na carteira")
 
 print()
 print("=" * 66)

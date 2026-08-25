@@ -176,6 +176,61 @@ def gravar_controle(conn: psycopg.Connection, chave: str, valor: str) -> None:
         )
 
 
+def sincronizar_base(conn: psycopg.Connection, cnpjs: list[str]) -> int:
+    """
+    Espelha a carteira em socio.base_cnpj — é contra ela que irmas_na_base conta.
+
+    Substitui o conteúdo inteiro em vez de fazer merge, e de propósito: lead que
+    SAIU da carteira tem que sair da contagem também. Merge deixaria o número
+    crescer para sempre.
+
+    Roda numa transação própria (a conexão é autocommit, então BEGIN explícito):
+    sem isso, o DELETE commitaria sozinho e uma falha no COPY deixaria a tabela
+    vazia — e todo irmas_na_base viraria zero em silêncio.
+    """
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute(f"DELETE FROM {settings.pg_socio_schema}.base_cnpj")
+            with cur.copy(
+                f"COPY {settings.pg_socio_schema}.base_cnpj (cnpj, cnpj_basico) "
+                "FROM STDIN"
+            ) as copy:
+                for c in cnpjs:
+                    copy.write_row((c, c[:8]))
+            cur.execute(f"SELECT count(*) FROM {settings.pg_socio_schema}.base_cnpj")
+            total = cur.fetchone()[0]
+    log.info(f"carteira espelhada em base_cnpj: {total:,} CNPJs")
+    return total
+
+
+def recontar_irmas_na_base(conn: psycopg.Connection) -> tuple[int, int]:
+    """
+    Reconta irmas_na_base na tabela toda, sem refazer o cálculo pesado.
+
+    POR QUE NÃO BASTA CALCULAR NO calcular_lote: irmas_na_base envelhece por um
+    motivo diferente do resto da linha. A Receita muda uma vez por mês, mas a
+    CARTEIRA muda todo dia — e um lead novo vira "irmã na base" de linhas já
+    gravadas, que o p_dias considera frescas e não recalcula. Sem esta passada,
+    o número dessas linhas só se corrigiria 45 dias depois.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT * FROM {settings.pg_socio_schema}.recontar_irmas_na_base(%s)",
+            (settings.socio_job_max_lista,),
+        )
+        atualizadas, no_teto = cur.fetchone()
+    if no_teto:
+        # A recontagem lê o cnpjs_irmas gravado, que tem teto. Quem passou do teto
+        # fica subestimado — avisar é melhor que devolver número menor calado.
+        log.warning(
+            f"{no_teto} linha(s) com mais irmãs que o teto de "
+            f"{settings.socio_job_max_lista}: irmas_na_base delas subestima. "
+            "Aumentar socio_job_max_lista se isto crescer."
+        )
+    log.info(f"irmas_na_base: {atualizadas:,} linha(s) atualizada(s)")
+    return atualizadas, no_teto
+
+
 def processar_lote(conn: psycopg.Connection, lote: list[str], dias: int) -> int:
     """Uma chamada de calcular_lote. Devolve quantas linhas voltaram."""
     with conn.cursor() as cur:
@@ -236,6 +291,10 @@ def rodar(dry_run: bool = False) -> dict:
             return {"status": "dry_run", "cnpjs": len(cnpjs),
                     "lotes": n_lotes, "dias": dias, "recarga": recarga}
 
+        # ANTES dos lotes: calcular_lote conta irmas_na_base contra base_cnpj,
+        # entao a carteira precisa estar espelhada quando o primeiro lote rodar.
+        sincronizar_base(conn, cnpjs)
+
         total = 0
         falhas = 0
         lotes = [
@@ -261,6 +320,12 @@ def rodar(dry_run: bool = False) -> dict:
                 # commitado, e o fetch_log mostra quem ficou de fora.
                 falhas += 1
                 log.error(f"lote {n}/{len(lotes)} falhou: {exc}")
+
+        # DEPOIS dos lotes: as linhas que o p_dias pulou nao passaram pelo
+        # calcular_lote e por isso nao viram a carteira de hoje. Esta passada
+        # corrige todas, e e barata — JOIN de 22k contra 22k, sem tocar rf_socios.
+        if not falhas:
+            recontar_irmas_na_base(conn)
 
         # Só marca o run_key numa execução limpa. Marcar um recálculo pela metade
         # faria o job achar que já absorveu a carga nova, e o resto ficaria velho

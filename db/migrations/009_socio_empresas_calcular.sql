@@ -122,18 +122,31 @@ BEGIN
         LEFT JOIN socio.faixa_etaria_ponto_medio f ON f.codigo = q.faixa_etaria
         GROUP BY q.cnpj
     ),
+    agg_na_base AS (
+        -- irmas_na_base: quantas das irmas estao na NOSSA carteira.
+        -- Cruza por cnpj_basico (8 digitos), NAO por CNPJ completo: as irmas sao
+        -- sempre matriz (0001) e a carteira tem 205 filiais — casar completo
+        -- devolveria zero nesses casos, e o erro seria invisivel.
+        -- Conta sobre o conjunto INTEIRO de irmas, antes do teto do campo texto.
+        SELECT i.cnpj, COUNT(DISTINCT LEFT(i.irma_cnpj, 8))::INT AS n_na_base
+        FROM   irmas i
+        JOIN   socio.base_cnpj b ON b.cnpj_basico = LEFT(i.irma_cnpj, 8)::CHAR(8)
+        GROUP  BY i.cnpj
+    ),
     calc AS MATERIALIZED (
         SELECT a.cnpj,
                EXISTS (SELECT 1 FROM cnpj.rf_estabelecimentos e
                         WHERE e.cnpj_basico = a.cnpj_basico) AS existe_rf,
                ai.n_irmas,
                ai.cnpjs_irmas,
+               COALESCE(anb.n_na_base, 0) AS irmas_na_base,
                COALESCE(asoc.n_socios, 0)    AS n_socios,
                COALESCE(asoc.n_socios_pf, 0) AS n_socios_pf,
                asoc.faixa_etaria_media
         FROM alvo a
-        LEFT JOIN agg_irmas  ai   ON ai.cnpj   = a.cnpj
-        LEFT JOIN agg_socios asoc ON asoc.cnpj = a.cnpj
+        LEFT JOIN agg_irmas   ai   ON ai.cnpj   = a.cnpj
+        LEFT JOIN agg_socios  asoc ON asoc.cnpj = a.cnpj
+        LEFT JOIN agg_na_base anb  ON anb.cnpj  = a.cnpj
     ),
     ins_log AS (
         -- CTE que escreve: é executada mesmo sem ninguém ler o resultado dela.
@@ -150,13 +163,14 @@ BEGIN
         RETURNING 1
     )
     INSERT INTO socio.socio_empresas (
-        cnpj, n_empresas_dono, cnpjs_irmas,
+        cnpj, n_empresas_dono, irmas_na_base, cnpjs_irmas,
         n_socios, n_socios_pf, faixa_etaria_media, atualizado_em
     )
     SELECT c.cnpj,
            -- CNPJ ausente da RF fica NULL, não 1: "1 empresa" seria afirmar que a
            -- empresa existe. Quem separa os dois casos é o fetch_log.
            CASE WHEN c.existe_rf THEN COALESCE(c.n_irmas, 0) + 1 END,
+           CASE WHEN c.existe_rf THEN c.irmas_na_base END,
            c.cnpjs_irmas,
            c.n_socios,
            c.n_socios_pf,
@@ -165,6 +179,7 @@ BEGIN
     FROM calc c
     ON CONFLICT (cnpj) DO UPDATE SET
         n_empresas_dono    = EXCLUDED.n_empresas_dono,
+        irmas_na_base      = EXCLUDED.irmas_na_base,
         cnpjs_irmas        = EXCLUDED.cnpjs_irmas,
         n_socios           = EXCLUDED.n_socios,
         n_socios_pf        = EXCLUDED.n_socios_pf,
