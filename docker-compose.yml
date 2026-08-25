@@ -100,6 +100,32 @@ services:
     healthcheck:
       disable: true
 
+  # ── Job socio_empresas — empresas irmãs da carteira ─────────────────────────
+  # Container próprio, e não mais um ramo dentro do scheduler.py: são cadências e
+  # falhas independentes. A checagem da RF é mensal e externa (webdav); esta roda
+  # todo dia e depende do Supabase do CRM. Juntar faria uma derrubar a outra.
+  #
+  # Roda às 4h (SOCIO_JOB_HOUR), depois da janela do scheduler da RF (3h): quando
+  # entra carga nova, o cálculo já pega rf_socios recém-trocada.
+  #
+  # Precisa de SUPABASE_URL e SUPABASE_KEY no .env — a lista de CNPJs é a
+  # carteira, que mora no Supabase do CRM. Sem elas o job para e diz isso.
+  socio-empresas:
+    build: .
+    container_name: cnpj_socio_empresas
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      LOG_DIR: "/logs"
+      TZ: "America/Sao_Paulo"
+    command: ["python", "socio_empresas_job.py"]
+    volumes:
+      - etl_logs:/logs
+    networks:
+      - cnpj_net
+    healthcheck:
+      disable: true
+
   # ── Redis Cache ─────────────────────────────────────────────────────────────
   redis:
     image: redis:7-alpine

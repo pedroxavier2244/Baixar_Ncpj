@@ -69,6 +69,27 @@ class Settings(BaseSettings):
     pg_schema: str = "cnpj"                  # dados finais tratados
     pg_staging_schema: str = "cnpj_staging"  # staging UNLOGGED (COPY rápido)
     pg_serving_schema: str = "cnpj_serving"  # materialized views para API
+    pg_socio_schema: str = "socio"           # derivados de vínculo societário (migration 008)
+
+    # ── Job socio_empresas — empresas irmãs por CNPJ ────────────────────────
+    # A lista de CNPJs a processar NÃO mora neste banco: são os leads da
+    # carteira, que vivem na tabela data_base do Supabase do CRM. Por isso o job
+    # precisa de credencial de leitura de lá — é a única coisa que este projeto
+    # busca fora da Receita.
+    #
+    # Chave: usar a de LEITURA. O job só faz SELECT em data_base; nada é escrito
+    # do lado do CRM.
+    socio_job_enabled: bool = True
+    socio_job_hour: int = 4                 # 4h: depois do scheduler da RF (3h)
+    socio_job_tz: str = "America/Sao_Paulo"
+    socio_job_poll_seconds: int = 1800
+    socio_job_dias: int = 45                # revisita linha mais velha que isto
+    socio_job_lote: int = 2000              # CNPJs por chamada de calcular_lote
+    socio_job_max_lista: int = 100          # teto de CNPJs no campo cnpjs_irmas
+    supabase_url: str = ""                  # ex.: https://xxxx.supabase.co
+    supabase_key: str = ""                  # service/anon key com leitura em data_base
+    supabase_base_table: str = "data_base"
+    supabase_base_coluna: str = "CD_CPF_CNPJ_CLIENTE"
 
     # Arquivos a baixar (palavras-chave no nome do arquivo)
     # Portes removido: RF parou de publicar em 2025-12 (tabela mantida no schema por compatibilidade)
