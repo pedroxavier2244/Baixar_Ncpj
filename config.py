@@ -77,8 +77,13 @@ class Settings(BaseSettings):
     # precisa de credencial de leitura de lá — é a única coisa que este projeto
     # busca fora da Receita.
     #
-    # Chave: usar a de LEITURA. O job só faz SELECT em data_base; nada é escrito
-    # do lado do CRM.
+    # O nome SUPABASE_SERVICE_KEY é o mesmo que o mb-crm usa — de propósito, para
+    # ser a variável que a pessoa já conhece em vez de mais um apelido.
+    #
+    # RESSALVA: a service key ignora RLS por completo. O job só faz SELECT em
+    # data_base, então uma chave com leitura restrita a essa tabela bastaria e
+    # seria bem menos perigosa nesta máquina, que é a do ETL da Receita e não
+    # tinha credencial do CRM até agora.
     socio_job_enabled: bool = True
     socio_job_hour: int = 4                 # 4h: depois do scheduler da RF (3h)
     socio_job_tz: str = "America/Sao_Paulo"
@@ -87,7 +92,7 @@ class Settings(BaseSettings):
     socio_job_lote: int = 2000              # CNPJs por chamada de calcular_lote
     socio_job_max_lista: int = 100          # teto de CNPJs no campo cnpjs_irmas
     supabase_url: str = ""                  # ex.: https://xxxx.supabase.co
-    supabase_key: str = ""                  # service/anon key com leitura em data_base
+    supabase_service_key: str = ""          # chave com leitura em data_base
     supabase_base_table: str = "data_base"
     supabase_base_coluna: str = "CD_CPF_CNPJ_CLIENTE"
 

@@ -108,7 +108,7 @@ services:
   # Roda às 4h (SOCIO_JOB_HOUR), depois da janela do scheduler da RF (3h): quando
   # entra carga nova, o cálculo já pega rf_socios recém-trocada.
   #
-  # Precisa de SUPABASE_URL e SUPABASE_KEY no .env — a lista de CNPJs é a
+  # Precisa de SUPABASE_URL e SUPABASE_SERVICE_KEY no .env — a lista de CNPJs é a
   # carteira, que mora no Supabase do CRM. Sem elas o job para e diz isso.
   socio-empresas:
     build: .

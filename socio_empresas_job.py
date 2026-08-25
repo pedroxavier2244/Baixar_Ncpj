@@ -59,10 +59,10 @@ def buscar_cnpjs_da_base() -> list[str]:
     22.141 medidos em 24/08/2026, ou 4,9%). Sem preencher, eles não casam com
     nada na Receita e sumiriam do resultado sem erro nenhum.
     """
-    if not settings.supabase_url or not settings.supabase_key:
+    if not settings.supabase_url or not settings.supabase_service_key:
         raise RuntimeError(
-            "SUPABASE_URL/SUPABASE_KEY não configuradas — sem elas o job não "
-            "sabe QUAIS CNPJs processar (a carteira mora no Supabase do CRM)"
+            "SUPABASE_URL/SUPABASE_SERVICE_KEY não configuradas — sem elas o job "
+            "não sabe QUAIS CNPJs processar (a carteira mora no Supabase do CRM)"
         )
 
     base = settings.supabase_url.rstrip("/")
@@ -79,8 +79,8 @@ def buscar_cnpjs_da_base() -> list[str]:
         })
         url = f"{base}/rest/v1/{settings.supabase_base_table}?{qs}"
         req = urllib.request.Request(url, headers={
-            "apikey":        settings.supabase_key,
-            "Authorization": f"Bearer {settings.supabase_key}",
+            "apikey":        settings.supabase_service_key,
+            "Authorization": f"Bearer {settings.supabase_service_key}",
         })
         with urllib.request.urlopen(req, timeout=60) as resp:
             linhas = json.loads(resp.read().decode("utf-8"))
