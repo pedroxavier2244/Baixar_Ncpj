@@ -25,7 +25,7 @@ COPY --from=builder /install /usr/local
 COPY api/        ./api/
 COPY steps/      ./steps/
 COPY db/         ./db/
-COPY config.py   logger.py orchestrator.py worker.py \
+COPY config.py   logger.py orchestrator.py worker.py webdav.py \
      enqueue_job.py scheduler.py setup.py socio_empresas_job.py ./
 
 # Diretórios de runtime — serão montados como volumes no docker-compose
