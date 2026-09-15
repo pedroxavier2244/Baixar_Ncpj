@@ -17,7 +17,7 @@ import sys
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote
 
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -25,6 +25,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 from config import settings
 from db.control import create_job, get_job_by_run_key, init_db, requeue_job
 from logger import get_logger
+from webdav import webdav_base, webdav_href_prefix
 
 log = get_logger("enqueue_job")
 
@@ -39,11 +40,6 @@ PROPFIND_BODY = """<?xml version="1.0"?>
 </d:propfind>"""
 
 
-def _webdav_base(share_url: str) -> str:
-    u = urlparse(share_url)
-    return f"{u.scheme}://{u.netloc}/public.php/webdav/"
-
-
 def _webdav_auth_candidates(token: str) -> list[tuple[str, str]]:
     # Different Nextcloud setups accept either password=token or username=token.
     return [("", token), (token, "")]
@@ -52,7 +48,7 @@ def _webdav_auth_candidates(token: str) -> list[tuple[str, str]]:
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=30))
 def propfind_listing(token: str, rel_path: str = "") -> list[dict]:
     """Return listing items from WebDAV PROPFIND for rel_path."""
-    base = _webdav_base(settings.webdav_share_url)
+    base = webdav_base(settings.webdav_share_url, token)
     url = base + rel_path.lstrip("/")
     last_error: Exception | None = None
     r: httpx.Response | None = None
@@ -82,7 +78,7 @@ def propfind_listing(token: str, rel_path: str = "") -> list[dict]:
     root = ET.fromstring(r.text)
     ns = {"d": "DAV:"}
     items = []
-    prefix = "/public.php/webdav/"
+    prefix = webdav_href_prefix(token)
     for response in root.findall("d:response", ns):
         href = (response.findtext("d:href", "", ns) or "")
         if prefix not in href:
