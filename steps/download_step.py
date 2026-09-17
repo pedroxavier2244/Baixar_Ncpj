@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from urllib.parse import urlparse
 
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -14,13 +13,13 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 from config import settings
 from logger import get_logger
 from steps.base import StepResult
+from webdav import webdav_base
 
 log = get_logger("step.download")
 
 
 def _webdav_base() -> str:
-    u = urlparse(settings.webdav_share_url)
-    return f"{u.scheme}://{u.netloc}/public.php/webdav/"
+    return webdav_base(settings.webdav_share_url, settings.webdav_token)
 
 
 def _webdav_auth_candidates(token: str) -> list[tuple[str, str]]:
