@@ -161,14 +161,47 @@ O pipeline é **checkpointed**: se falhar em algum step, retoma do ponto de falh
 ## Deploy na VPS
 
 ```bash
-# Local (Windows — usar ; não &&)
+# Local
 git add .; git commit -m "mensagem"; git push
 
 # VPS (bash)
-cd /opt/cnpj  # ou onde estiver o projeto
-git pull
-docker compose down && docker compose up -d --build
-docker ps  # verificar se cnpj_api está healthy
+cd /opt/cnpj
+git fetch origin nova && git rebase origin/nova   # NÃO `git pull`
+docker compose build worker scheduler             # só os serviços que mudaram
+docker compose up -d --no-deps worker scheduler
+docker ps --format "table {{.Names}}\t{{.Status}}" | grep cnpj
+```
+
+**Nunca rodar `docker compose down` em `/opt/cnpj`.** A rede `cnpj_cnpj_net`
+pertence a este projeto compose, mas o Postgres e dois containers do stack
+`implementation` (o CRM/ETL) estão ligados a ela:
+
+```
+implementation-api-1                     cnpj_cnpj_net implementation_default
+implementation-worker-etl-1              cnpj_cnpj_net implementation_default
+54bc71b1fc31_implementation-postgres-1   cnpj_cnpj_net implementation_default
+```
+
+`down` remove a rede e deixa os três sem resolução de nome — é o incidente de
+abril/2026 documentado abaixo, na direção inversa. `up` nunca recria rede que
+já existe, então é seguro; `down` não é.
+
+**Por que cada detalhe do comando:**
+
+| Detalhe | Se ignorar |
+|---|---|
+| `git fetch` + `rebase`, não `pull` | `/opt/cnpj` tem um commit local do `nginx.conf` nunca pushado; o pull diverge |
+| `build` com nome de serviço | Sem nome, rebuilda a imagem do `cnpj_api` também — que é quem o CRM consome |
+| `up` com nome de serviço | Sem nome, recria o worker e interrompe carga em andamento |
+| `--no-deps` | Sem ele, esbarra no nome do redis (`88ab8fd17ca0_cnpj_redis`) e deixa container órfão |
+
+Antes de recriar o worker, conferir que não há carga rodando:
+
+```bash
+docker exec -w /app -e PYTHONPATH=/app cnpj_worker python -c "
+from db.control import list_runs
+print([r['run_key'] for r in list_runs(50) if r['status'] in ('PENDING','RUNNING')])
+"
 ```
 
 **Verificar saúde da API:**
@@ -299,6 +332,7 @@ docker compose logs --tail 30 2>&1 | grep -i error
 
 ## Regras específicas deste projeto
 
+- **Nunca rodar `docker compose down` em `/opt/cnpj`** — a rede `cnpj_cnpj_net` é deste projeto, mas o Postgres e o stack `implementation` (CRM/ETL) dependem dela. Ver "Deploy na VPS".
 - **Nunca rodar DROP/DELETE/TRUNCATE** nas tabelas `cnpj.*` sem confirmação explícita — são dados de produção (~70M linhas).
 - **Nunca re-executar steps já concluídos** — verificar estado do job em `pipeline_control.db` antes.
 - **Sempre usar `cnpj_ordem = '0001'`** ao contar empresas para evitar dupla contagem de filiais.
