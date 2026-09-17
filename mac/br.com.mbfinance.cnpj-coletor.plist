@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Agendamento do coletor da Receita no Mac mini.
+
+  LaunchDaemon e não LaunchAgent: precisa rodar sem ninguém logado. Um Agent só
+  existe dentro de uma sessão gráfica, então depois de um reinício ele só
+  dispararia quando alguém fizesse login — e o ponto do coletor é justamente
+  não depender de ninguém olhar.
+
+  Instalar (ver mac/README.md):
+      sudo cp mac/br.com.mbfinance.cnpj-coletor.plist /Library/LaunchDaemons/
+      sudo chown root:wheel /Library/LaunchDaemons/br.com.mbfinance.cnpj-coletor.plist
+      sudo chmod 644       /Library/LaunchDaemons/br.com.mbfinance.cnpj-coletor.plist
+      sudo launchctl bootstrap system /Library/LaunchDaemons/br.com.mbfinance.cnpj-coletor.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>br.com.mbfinance.cnpj-coletor</string>
+
+    <!-- Roda como o dono do repo, não como root: a chave SSH, o venv e os ZIPs
+         vivem no home dele. Como root, o rsync entregaria arquivo com dono
+         errado e o ssh não acharia a configuração. -->
+    <key>UserName</key>
+    <string>transferoacademy</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/transferoacademy/cnpj/Baixar_Ncpj/.venv/bin/python</string>
+        <string>/Users/transferoacademy/cnpj/Baixar_Ncpj/mac/coletor.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/transferoacademy/cnpj/Baixar_Ncpj</string>
+
+    <!-- 22:00 no relógio local. O launchd agenda por hora local, e o fuso do
+         sistema é America/Sao_Paulo — por isso o agendamento mora aqui e não na
+         VPS, que roda em Europe/Berlin. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>22</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <!-- Não dispara no bootstrap nem em cada reinício: queda de energia às 3h
+         não deve virar um download de 7,76 GB fora da janela. -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- HOME explícito por precaução, não por necessidade comprovada: sem
+             ela, ssh, rsync e Path.home() caem no passwd do usuário e acertam o
+             mesmo caminho (testado em 17/09/2026). Deixar explícito tira a
+             dependência desse fallback. -->
+        <key>HOME</key>
+        <string>/Users/transferoacademy</string>
+        <!-- O PATH padrão do launchd não inclui o Homebrew. O coletor chama o
+             rsync por caminho absoluto, mas o ssh vem do PATH. -->
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>TZ</key>
+        <string>America/Sao_Paulo</string>
+    </dict>
+
+    <!-- Standard explícito: em Background o launchd aplica I/O de baixa
+         prioridade, e este job move 7,76 GB para baixo e para cima. -->
+    <key>ProcessType</key>
+    <string>Standard</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/transferoacademy/cnpj/logs/coletor.launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/transferoacademy/cnpj/logs/coletor.launchd.err</string>
+</dict>
+</plist>
