@@ -7,6 +7,16 @@ Usage:
     python enqueue_job.py --run-key 2026-02  # specific month
     python enqueue_job.py --force            # re-enqueue even if already done
     python enqueue_job.py --check-only       # just print status, no enqueue
+
+Modos sem rede, para quando o download acontece fora desta máquina
+(desde 11/09/2026 a VPS não alcança a Receita — ver docs/HANDOFF-MAC-MINI.md):
+
+    python enqueue_job.py --status --run-key 2026-10       # JSON do job, ou null
+    python enqueue_job.py --files-ready --run-key 2026-10  # confere e cria o job
+
+Os dois nunca falam com a Receita: leem o manifest já salvo em CHECKPOINT_DIR e
+o que está em DATA_DIR. Moram aqui de propósito — módulo novo na raiz obrigaria
+a mexer no COPY do Dockerfile, que já derrubou o container uma vez (15/09/2026).
 """
 from __future__ import annotations
 
@@ -179,6 +189,138 @@ def detect_wanted(run_key: str | None = None) -> tuple[str, list[dict]]:
     return run_key, wanted
 
 
+def job_status(run_key: str) -> dict | None:
+    """
+    Status do job de run_key, ou None se não existir nenhum.
+    Não toca a rede: é a resposta para "essa máquina já processou esse mês?".
+    """
+    init_db()
+    row = get_job_by_run_key(run_key)
+    if row is None:
+        return None
+    return {
+        "run_key": row["run_key"],
+        "job_id": row["job_id"],
+        "status": row["status"],
+        "attempts": row["attempts"],
+        "max_attempts": row["max_attempts"],
+        "created_at": row["created_at"],
+        "started_at": row["started_at"],
+        "finished_at": row["finished_at"],
+        "last_error": row["last_error"],
+    }
+
+
+def check_local_files(run_key: str) -> dict:
+    """
+    Confere DATA_DIR/<run_key> contra o manifest salvo, por nome e tamanho.
+
+    Tamanho e não checksum de propósito: o CRC de cada membro do ZIP é trabalho
+    do verify_step, que roda depois. O que esta conferência precisa barrar é o
+    arquivo truncado, porque o download_step trata qualquer arquivo com tamanho
+    maior que zero como pronto e o pula.
+    """
+    manifest = _load_manifest(run_key)
+    if manifest is None:
+        return {"ok": False, "reason": "manifest_missing",
+                "manifest_path": str(_manifest_path(run_key))}
+
+    files = manifest.get("files", [])
+    if not files:
+        return {"ok": False, "reason": "manifest_empty",
+                "manifest_path": str(_manifest_path(run_key))}
+
+    data_dir = settings.data_dir / run_key
+    esperados = {f["name"]: int(f["size"]) for f in files}
+
+    problemas: list[str] = []
+    total_bytes = 0
+    for nome, tamanho in sorted(esperados.items()):
+        p = data_dir / nome
+        if not p.exists():
+            problemas.append(f"falta {nome}")
+            continue
+        real = p.stat().st_size
+        if real != tamanho:
+            problemas.append(f"tamanho {nome}: {real} != {tamanho}")
+            continue
+        total_bytes += real
+
+    # Arquivo fora do manifest não quebra nada — extract_step itera o manifest,
+    # nunca a pasta — mas um `.part` sobrando é sinal de transporte interrompido.
+    extras = (
+        sorted(p.name for p in data_dir.iterdir() if p.name not in esperados)
+        if data_dir.is_dir() else []
+    )
+
+    return {
+        "ok": not problemas,
+        "reason": None if not problemas else "files_mismatch",
+        "run_key": run_key,
+        "esperados": len(esperados),
+        "conferidos": len(esperados) - len(problemas),
+        "problemas": problemas,
+        "extras": extras,
+        "bytes": total_bytes,
+    }
+
+
+def files_ready(run_key: str, dry_run: bool = False) -> dict:
+    """
+    Cria o job de run_key a partir de arquivos que já estão em DATA_DIR.
+
+    Para quando o download foi feito em outra máquina. Confere tudo contra o
+    manifest antes e recusa se já existir qualquer job para o mês — reprocessar
+    um DEAD é decisão manual, não automática.
+    """
+    init_db()
+
+    # A existência do job vem antes da conferência de arquivos de propósito: é a
+    # guarda mais forte e a mais barata. Na ordem inversa, um mês já processado
+    # — cujos ZIPs o cleanup_step apagou — seria recusado por "arquivo faltando",
+    # escondendo o motivo real atrás de 37 linhas de falso alarme.
+    existing = get_job_by_run_key(run_key)
+    if existing is not None:
+        return {
+            "status": "job_exists",
+            "run_key": run_key,
+            "job_id": existing["job_id"],
+            "job_status": existing["status"],
+        }
+
+    conferencia = check_local_files(run_key)
+    if not conferencia["ok"]:
+        return {"status": conferencia["reason"], **conferencia}
+
+    if conferencia["extras"]:
+        log.warning(
+            f"{run_key}: {len(conferencia['extras'])} arquivo(s) fora do manifest "
+            f"em {settings.data_dir / run_key}: {conferencia['extras'][:5]}"
+        )
+
+    if dry_run:
+        log.info(f"dry-run: {run_key} pronto para virar job, nada foi criado")
+        return {"status": "dry_run_ok", **conferencia}
+
+    manifest = _load_manifest(run_key) or {}
+    job_id = create_job(run_key, payload={
+        "files": manifest.get("files", []),
+        "enqueued_at": datetime.now(timezone.utc).isoformat(),
+        "origem": "arquivos entregues por outra maquina (--files-ready)",
+    })
+    log.info(
+        f"job criado job_id={job_id} run_key={run_key} "
+        f"arquivos={conferencia['esperados']} bytes={conferencia['bytes']}"
+    )
+    return {
+        "status": "created",
+        "run_key": run_key,
+        "job_id": job_id,
+        "files": conferencia["esperados"],
+        "bytes": conferencia["bytes"],
+    }
+
+
 def check_and_enqueue(run_key: str | None = None, force: bool = False) -> dict:
     """
     Checa o WebDAV e enfileira um job se houver dado novo/alterado.
@@ -226,7 +368,36 @@ def main() -> None:
                         help="Re-enqueue even if already SUCCESS")
     parser.add_argument("--check-only", action="store_true",
                         help="Only check status, do not create job")
+    parser.add_argument("--status", action="store_true",
+                        help="Imprime o JSON do job de --run-key (ou null). Sem rede.")
+    parser.add_argument("--files-ready", action="store_true",
+                        help="Confere DATA_DIR/<run-key> contra o manifest e cria o "
+                             "job. Para download feito em outra maquina. Sem rede.")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Com --files-ready: confere tudo mas nao cria o job")
     args = parser.parse_args()
+
+    # ── Modos sem rede ──────────────────────────────────────────────────────
+    # Vêm antes de tudo: não chamam a Receita e não devem nem logar tentativa.
+    if args.status or args.files_ready:
+        if args.status and args.files_ready:
+            parser.error("--status e --files-ready sao mutuamente exclusivos")
+        if not args.run_key:
+            parser.error("--run-key AAAA-MM e obrigatorio com --status/--files-ready")
+        if not re.fullmatch(r"\d{4}-\d{2}", args.run_key):
+            parser.error(f"--run-key deve ser AAAA-MM, recebi {args.run_key!r}")
+
+        if args.status:
+            print(json.dumps(job_status(args.run_key), indent=2, ensure_ascii=False))
+            sys.exit(0)
+
+        settings.ensure_dirs()
+        result = files_ready(args.run_key, dry_run=args.dry_run)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        if result["status"] not in ("created", "dry_run_ok"):
+            log.error(f"--files-ready recusou {args.run_key}: {result['status']}")
+            sys.exit(1)
+        sys.exit(0)
 
     init_db()
     settings.ensure_dirs()
