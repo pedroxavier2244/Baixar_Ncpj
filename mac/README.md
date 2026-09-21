@@ -78,6 +78,47 @@ para você conferir; apague na mão depois.
 
 Os dois arquivos do launchd não rotacionam — crescem devagar, mas crescem.
 
+## Batimento e vigia
+
+O modo de falha mais provável deste desenho não produz erro nenhum: Mac mini
+desligado, sem rede ou com o LaunchDaemon parado não geram log em lugar algum —
+o mês não entra e a API segue servindo o anterior sem reclamar. Silêncio se
+parece com "a Receita ainda não publicou".
+
+Por isso o coletor grava um batimento na VPS **no fim de toda execução**,
+inclusive quando falha:
+
+```
+/var/lib/docker/volumes/cnpj_etl_checkpoints/_data/coletor_batimento.json
+```
+
+E `vps/vigia-cnpj.sh` roda no host da VPS de hora em hora (crontab do root,
+minuto 15, com `flock`), avisando por WhatsApp:
+
+| Gatilho | Quando você sabe |
+|---|---|
+| Sem batimento há +48h | ~2 dias |
+| Último batimento diz `falha` | ~1 hora |
+| Bridge do WhatsApp desconectada | ~1 hora |
+
+Fala uma vez por incidente e avisa quando volta ao normal. O `--ensaio` não
+grava batimento de propósito: é teste manual, e marcar presença por ele faria o
+vigia aceitar como prova de vida algo que não prova que o daemon roda.
+
+Conferir na mão, sem enviar nada:
+
+```bash
+ssh cnpj-vps 'bash /opt/cnpj/vps/vigia-cnpj.sh --dry-run'
+ssh cnpj-vps 'cat /var/log/cnpj-vigia.log | tail'
+```
+
+**O `/health` da bridge mente.** Ela responde `{"status":"conectado"}` a partir
+de uma variável interna que não acompanha a queda do socket do WhatsApp — visto
+em 21/09/2026: um envio falhou com `Connection Closed` e o Baileys reconectou 12
+segundos depois, com o `/health` dizendo "conectado" o tempo todo. Por isso o
+vigia confere o HTTP do POST e só considera avisado o que saiu com 200; se
+falhar, não grava a deduplicação e tenta de novo na hora seguinte.
+
 ## Pré-requisitos desta máquina
 
 Conferidos em 17/09/2026:
