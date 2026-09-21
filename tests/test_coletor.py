@@ -356,3 +356,70 @@ def test_destino_divergente_nao_cria_job():
             c.coletar()
         enviar.assert_not_called()
         criar.assert_not_called()
+
+
+# ── Batimento ─────────────────────────────────────────────────────────────────
+# O batimento é a única defesa contra a falha que não produz erro nenhum: Mac
+# mini desligado, sem rede ou com o daemon parado não geram log em lugar algum.
+
+def test_batimento_gravado_no_caminho_feliz():
+    c = _coletor()
+    with patch.object(c, "_ssh", return_value="") as ssh:
+        c.gravar_batimento("ok", "entregue", "2026-10 entregue", "2026-10", 31.4)
+        remoto, = ssh.call_args[0]
+        payload = json.loads(ssh.call_args[1]["entrada"])
+
+    assert payload["resultado"] == "ok"
+    assert payload["acao"] == "entregue"
+    assert payload["run_key"] == "2026-10"
+    assert payload["duracao_min"] == 31.4
+    # tmp + mv: o vigia nunca pode ler um JSON pela metade
+    assert ".tmp" in remoto and "mv " in remoto
+    # sem o chown o worker (uid 1001) não lê o que o root escreveu
+    assert "chown 1001:1001" in remoto
+
+
+def test_batimento_registra_falha():
+    """Sem isto o vigia levaria 48h para notar o que ele nota em 1h."""
+    c = _coletor()
+    with patch.object(c, "_ssh", return_value="") as ssh:
+        c.gravar_batimento("falha", "erro", "download_step falhou", "2026-10", 3.2)
+        payload = json.loads(ssh.call_args[1]["entrada"])
+    assert payload["resultado"] == "falha"
+    assert payload["detalhe"] == "download_step falhou"
+
+
+def test_batimento_trunca_detalhe_longo():
+    c = _coletor()
+    with patch.object(c, "_ssh", return_value="") as ssh:
+        c.gravar_batimento("falha", "erro", "x" * 5000, "2026-10", 1.0)
+        payload = json.loads(ssh.call_args[1]["entrada"])
+    assert len(payload["detalhe"]) == 500
+
+
+def test_batimento_que_falha_nao_derruba_a_execucao():
+    """O resultado real já está no log; um batimento perdido não pode mascará-lo."""
+    c = _coletor()
+    with patch.object(c, "_ssh", side_effect=c.ErroColetor("ssh caiu")):
+        c.gravar_batimento("ok", "nada_a_fazer", "tudo certo", "2026-09", 0.1)
+
+
+def test_batimento_tem_fuso():
+    """O vigia compara com o agora dele; data sem fuso daria diferença de horas."""
+    c = _coletor()
+    with patch.object(c, "_ssh", return_value="") as ssh:
+        c.gravar_batimento("ok", "nada_a_fazer", "ok", "2026-09", 0.1)
+        ts = json.loads(ssh.call_args[1]["entrada"])["ts"]
+    from datetime import datetime
+    assert datetime.fromisoformat(ts).tzinfo is not None
+
+
+def test_coletar_publica_o_run_key_no_contexto():
+    """O encerramento normal sai por NadaAFazer; sem o ctx o batimento não teria mês."""
+    c = _coletor()
+    ctx = {}
+    with patch.object(c.ej, "detect_wanted", return_value=("2026-10", _items(48))), \
+         patch.object(c, "decidir_pelo_status", side_effect=c.NadaAFazer("ja esta SUCCESS")):
+        with pytest.raises(c.NadaAFazer):
+            c.coletar(ctx=ctx)
+    assert ctx["run_key"] == "2026-10"

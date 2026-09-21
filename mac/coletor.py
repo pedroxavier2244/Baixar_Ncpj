@@ -84,6 +84,10 @@ LOCK_PATH = Path(os.environ.get("CNPJ_LOCK", str(Path.home() / "cnpj" / "coletor
 # ilegível para ele.
 DONO_VPS = "1001:1001"
 
+# Batimento: o vigia da VPS lê este arquivo para saber se esta máquina ainda
+# está viva. Fica no volume de checkpoints porque o host lê de lá sem container.
+BATIMENTO = "coletor_batimento.json"
+
 # Status de job que significam "não há nada para eu fazer".
 SEM_TRABALHO = {"PENDING", "RUNNING", "FAILED"}
 
@@ -399,6 +403,45 @@ def criar_job(run_key: str) -> None:
     log.info(f"--files-ready: {saida.strip()}")
 
 
+def gravar_batimento(resultado: str, acao: str, detalhe: str,
+                     run_key: str | None, duracao_min: float) -> None:
+    """
+    Registra na VPS que esta máquina rodou, e como terminou.
+
+    É a única defesa contra o modo de falha que não produz erro nenhum: Mac mini
+    desligado, sem rede ou com o daemon parado não geram log em lugar nenhum —
+    o mês simplesmente não entra, e silêncio se parece com "não teve novidade".
+
+    Grava também quando a execução falha, e é isso que dá a detecção rápida: o
+    vigia distingue "não vejo batimento há 48h" de "o último batimento diz
+    falha", e o segundo ele avisa na hora seguinte.
+
+    Nunca levanta: um batimento que falha não pode mascarar o resultado real da
+    execução, que já está no log.
+    """
+    payload = {
+        "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "resultado": resultado,          # ok | falha
+        "acao": acao,                    # nada_a_fazer | entregue | erro
+        "run_key": run_key,
+        "detalhe": detalhe[:500],
+        "duracao_min": round(duracao_min, 1),
+    }
+    destino = f"{VPS_CHECKPOINTS}/{BATIMENTO}"
+    tmp = f"{destino}.tmp"
+    # tmp + mv: o vigia nunca pode ler um JSON pela metade.
+    remoto = (
+        f"cat > {shlex.quote(tmp)} && "
+        f"mv {shlex.quote(tmp)} {shlex.quote(destino)} && "
+        f"chown {DONO_VPS} {shlex.quote(destino)}"
+    )
+    try:
+        _ssh(remoto, entrada=json.dumps(payload, ensure_ascii=False), timeout=60)
+        log.info(f"batimento gravado: resultado={resultado} acao={acao}")
+    except Exception as exc:
+        log.warning(f"nao consegui gravar o batimento na VPS: {exc}")
+
+
 # ── Trava ─────────────────────────────────────────────────────────────────────
 
 @contextmanager
@@ -422,9 +465,18 @@ def trava():
 
 # ── Fluxo ─────────────────────────────────────────────────────────────────────
 
-def coletar(run_key_forcado: str | None = None, ensaio: bool = False) -> None:
+def coletar(run_key_forcado: str | None = None, ensaio: bool = False,
+            ctx: dict | None = None) -> None:
+    """
+    `ctx` recebe o run_key assim que ele é conhecido. O encerramento normal sai
+    por NadaAFazer de dentro de qualquer passo, então não há valor de retorno
+    para carregá-lo — e o batimento precisa dizer de que mês estava falando.
+    """
+    ctx = {} if ctx is None else ctx
+
     passo(1, "detectando o mes publicado na Receita")
     run_key, arquivos = ej.detect_wanted(run_key_forcado)
+    ctx["run_key"] = run_key
     total = sum(int(a.get("size", 0)) for a in arquivos)
     log.info(f"mes={run_key} arquivos={len(arquivos)} tamanho={total / 1e9:.2f} GB")
 
@@ -514,21 +566,34 @@ def main() -> int:
     inicio = time.monotonic()
     log.info(f"=== coletor iniciado {datetime.now().isoformat(timespec='seconds')} "
              f"{'(ENSAIO)' if args.ensaio else ''}")
+
+    ctx: dict = {}
+    rc = 0
+    resultado, acao, detalhe = "falha", "erro", "encerrou sem dizer por que"
     try:
         with trava():
-            coletar(args.run_key, ensaio=args.ensaio)
+            coletar(args.run_key, ensaio=args.ensaio, ctx=ctx)
+        resultado, acao = "ok", "entregue"
+        detalhe = f"{ctx.get('run_key')} entregue e job criado"
     except NadaAFazer as motivo:
         log.info(f"encerrando: {motivo}")
-        return 0
+        resultado, acao, detalhe = "ok", "nada_a_fazer", str(motivo)
     except ErroColetor as erro:
         log.error(f"FALHA: {erro}")
-        return 1
+        resultado, acao, detalhe = "falha", "erro", str(erro)
+        rc = 1
     except Exception as erro:  # rede, SSH, disco
         log.exception(f"FALHA inesperada: {erro}")
-        return 1
+        resultado, acao, detalhe = "falha", "erro", f"{type(erro).__name__}: {erro}"
+        rc = 1
     finally:
-        log.info(f"=== coletor terminou em {(time.monotonic() - inicio) / 60:.1f} min")
-    return 0
+        duracao = (time.monotonic() - inicio) / 60
+        # Ensaio não bate: é teste manual, e marcar presença por ele faria o
+        # vigia aceitar como prova de vida algo que não prova que o daemon roda.
+        if not args.ensaio:
+            gravar_batimento(resultado, acao, detalhe, ctx.get("run_key"), duracao)
+        log.info(f"=== coletor terminou em {duracao:.1f} min")
+    return rc
 
 
 if __name__ == "__main__":
