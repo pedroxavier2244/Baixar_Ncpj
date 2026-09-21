@@ -317,12 +317,20 @@ def test_execucao_normal_renomeia_e_cria_o_job():
          patch.object(c, "estado_do_destino_final", return_value="ausente"), \
          patch.object(c, "renomear_no_servidor") as renomear, \
          patch.object(c, "entregar_manifest") as manifest, \
+         patch.object(c, "avisar") as avisar, \
          patch.object(c, "criar_job") as criar:
         c.coletar()
         enviar.assert_called_once()
         renomear.assert_called_once_with("2026-10")
         manifest.assert_called_once_with("2026-10")
         criar.assert_called_once_with("2026-10")
+
+    # três avisos de progresso: mês novo, download pronto, carga entregue
+    textos = [ch.args[0] for ch in avisar.call_args_list]
+    assert len(textos) == 3
+    assert "A Receita publicou 2026-10" in textos[0]
+    assert "Download de 2026-10 concluido" in textos[1]
+    assert "2026-10 entregue" in textos[2]
 
 
 def test_destino_completo_pula_envio_mas_cria_o_job():
@@ -336,6 +344,7 @@ def test_destino_completo_pula_envio_mas_cria_o_job():
          patch.object(c, "estado_do_destino_final", return_value="completo"), \
          patch.object(c, "renomear_no_servidor") as renomear, \
          patch.object(c, "entregar_manifest"), \
+         patch.object(c, "avisar"), \
          patch.object(c, "criar_job") as criar:
         c.coletar()
         enviar.assert_not_called()
@@ -423,3 +432,86 @@ def test_coletar_publica_o_run_key_no_contexto():
         with pytest.raises(c.NadaAFazer):
             c.coletar(ctx=ctx)
     assert ctx["run_key"] == "2026-10"
+
+
+# ── Avisos de progresso ───────────────────────────────────────────────────────
+
+def test_avisar_nao_envia_sob_pytest():
+    """
+    Trava dura contra o erro de 21/09/2026: dois testes que chamam coletar()
+    esqueceram de mockar `avisar` e a suite mandou 8 mensagens para uma pessoa
+    de verdade. Mockar em cada teste é disciplina; isto é garantia.
+    """
+    c = _coletor()
+    with patch.object(c, "_ssh") as ssh:
+        c.avisar("mensagem que nao pode sair")
+        ssh.assert_not_called()
+
+
+def test_avisar_respeita_a_chave_de_desligar(monkeypatch):
+    c = _coletor()
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    with patch.object(c, "AVISAR", False), patch.object(c, "_ssh") as ssh:
+        c.avisar("nao envia")
+        ssh.assert_not_called()
+
+
+def test_avisar_manda_o_json_pelo_stdin(monkeypatch):
+    """A mensagem tem acento e quebra de linha; na linha de comando isso quebra."""
+    c = _coletor()
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    with patch.object(c, "_ssh", return_value="\n200") as ssh:
+        c.avisar("🆕 *Publicou*\nlinha dois")
+        remoto, = ssh.call_args[0]
+        corpo = json.loads(ssh.call_args[1]["entrada"])
+    assert "--data @-" in remoto
+    assert corpo["to"] == c.DEST_WHATSAPP
+    assert corpo["text"] == "🆕 *Publicou*\nlinha dois"
+
+
+def test_avisar_reclama_quando_a_bridge_recusa(monkeypatch, caplog):
+    """O /health da bridge diz 'conectado' mesmo com o socket caido."""
+    c = _coletor()
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    with patch.object(c, "_ssh", return_value='{"erro":"Connection Closed"}\n500'):
+        with caplog.at_level("WARNING"):
+            c.avisar("tentativa")
+    assert "NAO saiu" in caplog.text and "500" in caplog.text
+
+
+def test_avisar_que_falha_nao_derruba_a_execucao(monkeypatch):
+    """Aviso é conforto; a carga não pode parar porque o WhatsApp caiu."""
+    c = _coletor()
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    with patch.object(c, "_ssh", side_effect=c.ErroColetor("ssh caiu")):
+        c.avisar("tentativa")
+
+
+def test_ensaio_nao_avisa_ninguem():
+    """Ensaio é teste manual: 'A Receita publicou' seria alarme falso."""
+    c = _coletor()
+    conf_ok = {"existe": True, "ok": True, "problemas": [], "conferidos": 37, "esperados": 37}
+    with patch.object(c.ej, "detect_wanted", return_value=("2026-09", _items(48))), \
+         patch.object(c, "decidir_pelo_status"), \
+         patch.object(c, "baixar"), \
+         patch.object(c, "conferir_local", return_value={"Empresas0.zip": 10}), \
+         patch.object(c, "enviar"), \
+         patch.object(c, "conferir_no_servidor", return_value=conf_ok), \
+         patch.object(c, "avisar") as avisar:
+        with pytest.raises(c.NadaAFazer, match="ensaio concluido"):
+            c.coletar(ensaio=True)
+    avisar.assert_not_called()
+
+
+def test_dia_sem_novidade_nao_avisa():
+    """
+    ~29 dias por mês o coletor encerra em 6s. Aviso diário de 'nada novo'
+    treinaria quem lê a ignorar a mensagem que importa.
+    """
+    c = _coletor()
+    with patch.object(c.ej, "detect_wanted", return_value=("2026-09", _items(48))), \
+         patch.object(c, "decidir_pelo_status", side_effect=c.NadaAFazer("ja esta SUCCESS")), \
+         patch.object(c, "avisar") as avisar:
+        with pytest.raises(c.NadaAFazer):
+            c.coletar()
+    avisar.assert_not_called()

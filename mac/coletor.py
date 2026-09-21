@@ -88,6 +88,17 @@ DONO_VPS = "1001:1001"
 # está viva. Fica no volume de checkpoints porque o host lê de lá sem container.
 BATIMENTO = "coletor_batimento.json"
 
+# Avisos de progresso. A bridge escuta só em 127.0.0.1 na VPS, então o caminho
+# é o mesmo do batimento: SSH e curl de lá.
+#
+# Divisão de responsabilidade com o vigia-cnpj.sh: o coletor avisa o PROGRESSO,
+# o vigia avisa os PROBLEMAS. Se os dois avisassem falha, o mesmo incidente
+# renderia duas mensagens — e o vigia existe exatamente para o caso em que esta
+# máquina não consegue falar.
+BRIDGE = os.environ.get("CNPJ_BRIDGE", "http://127.0.0.1:3131")
+DEST_WHATSAPP = os.environ.get("CNPJ_DEST_WHATSAPP", "5521971506193@s.whatsapp.net")
+AVISAR = os.environ.get("CNPJ_AVISAR", "1") != "0"
+
 # Status de job que significam "não há nada para eu fazer".
 SEM_TRABALHO = {"PENDING", "RUNNING", "FAILED"}
 
@@ -403,6 +414,50 @@ def criar_job(run_key: str) -> None:
     log.info(f"--files-ready: {saida.strip()}")
 
 
+def avisar(texto: str) -> None:
+    """
+    Manda um aviso de progresso no WhatsApp, pela bridge da VPS.
+
+    Só é chamada nos momentos em que há novidade de verdade — mês novo
+    detectado, download pronto, carga entregue. Nos outros ~29 dias do mês o
+    coletor encerra em 6 segundos sem dizer nada: aviso diário de "não há nada
+    novo" vira ruído e treina quem lê a ignorar a mensagem que importa.
+
+    Confere o código HTTP porque o `status` da bridge não acompanha a queda do
+    socket do WhatsApp: ela responde "conectado" e o envio falha assim mesmo
+    (visto em 21/09/2026). Nunca levanta — aviso é conforto, não o trabalho.
+    """
+    # Trava dura: teste nunca pode mandar mensagem para pessoa de verdade.
+    # Mockar `avisar` em cada teste não basta — em 21/09/2026 dois testes que
+    # chamam coletar() com os passos mockados esqueceram deste, e a suite
+    # disparou 8 mensagens. O pytest exporta PYTEST_CURRENT_TEST em toda
+    # execução; isto faz o esquecimento virar impossível em vez de improvável.
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        log.info(f"rodando sob pytest, nao envio: {texto[:60]}")
+        return
+
+    if not AVISAR:
+        log.info(f"avisos desligados (CNPJ_AVISAR=0), nao enviei: {texto[:60]}")
+        return
+
+    corpo = json.dumps({"to": DEST_WHATSAPP, "text": texto}, ensure_ascii=False)
+    # --data @- lê o JSON do stdin: evita passar a mensagem pela linha de
+    # comando, onde acento e quebra de linha viram problema de quoting.
+    remoto = (
+        f"curl -s -m 60 -w '\n%{{http_code}}' -X POST {shlex.quote(BRIDGE + '/send')} "
+        f"-H 'Content-Type: application/json' --data @-"
+    )
+    try:
+        saida = _ssh(remoto, entrada=corpo, timeout=90)
+        codigo = saida.strip().splitlines()[-1] if saida.strip() else "sem-resposta"
+        if codigo == "200":
+            log.info("aviso enviado no WhatsApp")
+        else:
+            log.warning(f"aviso NAO saiu (HTTP {codigo}): {saida.strip()[:200]}")
+    except Exception as exc:
+        log.warning(f"nao consegui avisar no WhatsApp: {exc}")
+
+
 def gravar_batimento(resultado: str, acao: str, detalhe: str,
                      run_key: str | None, duracao_min: float) -> None:
     """
@@ -495,8 +550,26 @@ def coletar(run_key_forcado: str | None = None, ensaio: bool = False,
     passo(3, "consultando o status do job na VPS")
     decidir_pelo_status(run_key, ensaio=ensaio)
 
+    # Daqui para baixo há trabalho de verdade. O aviso vem DEPOIS do passo 3, e
+    # não na detecção: a Receita serve o mesmo mês por semanas, então avisar na
+    # detecção mandaria a mesma mensagem todo dia. O que é novidade é haver
+    # trabalho, e quem responde isso é o job_queue da VPS.
+    if not ensaio:
+        avisar(
+            f"🆕 *A Receita publicou {run_key}*\n\n"
+            f"{len(arquivos)} arquivos, {total / 1e9:.2f} GB\n"
+            f"Baixando agora."
+        )
+
     passo(4, "baixando os ZIPs")
+    t_download = time.monotonic()
     baixar(run_key, arquivos)
+    if not ensaio:
+        avisar(
+            f"⬇️ *Download de {run_key} concluido*\n\n"
+            f"{total / 1e9:.2f} GB em {(time.monotonic() - t_download) / 60:.0f} min\n"
+            f"Conferindo e enviando para a VPS."
+        )
 
     passo(5, "conferindo os arquivos baixados")
     esperados = conferir_local(run_key)
@@ -552,6 +625,12 @@ def coletar(run_key_forcado: str | None = None, ensaio: bool = False,
     criar_job(run_key)
 
     log.info(f"{run_key}: entregue. O worker da VPS leva ~4h daqui ate SUCCESS.")
+    avisar(
+        f"✅ *{run_key} entregue a VPS*\n\n"
+        f"Job criado, {len(esperados)} arquivos.\n"
+        f"O processamento leva ~4h; a API passa a servir {run_key} quando terminar.\n\n"
+        f"_Se algo falhar no meio, o vigia avisa._"
+    )
 
 
 def main() -> int:
