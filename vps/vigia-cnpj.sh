@@ -46,6 +46,23 @@ done
 mkdir -p "$(dirname "$ESTADO")"
 log(){ echo "$(TZ=$TZ_BR date '+%F %T') $*" >> "$LOG"; }
 
+# Envia e confere de verdade. `curl -s` sozinho sai com 0 ate em HTTP 500 — o
+# vigia registraria "alerta enviado" para uma mensagem que a bridge recusou, que
+# e a pior falha possivel aqui: silencio com aparencia de funcionamento.
+enviar(){
+  local texto="$1" corpo resposta codigo
+  corpo=$(python3 -c "import json,sys;print(json.dumps({'to':'$DEST','text':sys.stdin.read()}))" <<<"$texto")
+  resposta=$(curl -s -m 60 -w '\n%{http_code}' -X POST "$BRIDGE/send" \
+             -H 'Content-Type: application/json' --data "$corpo" 2>&1)
+  codigo=$(tail -n1 <<<"$resposta")
+  if [ "$codigo" = "200" ]; then
+    log "VIGIA-CNPJ | enviado (HTTP $codigo)"
+    return 0
+  fi
+  log "VIGIA-CNPJ | FALHOU ao enviar (HTTP ${codigo:-sem-resposta}): $(sed '$d' <<<"$resposta" | tr -d '\n' | cut -c1-200)"
+  return 1
+}
+
 problemas=()
 
 # 1) existe batimento?
@@ -106,11 +123,13 @@ if [ ${#problemas[@]} -eq 0 ]; then
 $texto"
     log "VIGIA-CNPJ | recuperado"
     [ "$MODO" = "dry" ] && { echo "--- DRY-RUN ---"; echo "$MSG"; exit 0; }
-    body=$(python3 -c "import json,sys;print(json.dumps({'to':'$DEST','text':sys.stdin.read()}))" <<<"$MSG")
-    curl -s -m 60 -X POST "$BRIDGE/send" -H 'Content-Type: application/json' --data "$body" >/dev/null 2>&1 \
-      && log "VIGIA-CNPJ | aviso de recuperacao enviado" || log "VIGIA-CNPJ | FALHOU ao enviar recuperacao"
-    echo "vazio" > "$ESTADO"
-    echo "recuperado — aviso enviado"
+    # O estado so e limpo se a mensagem saiu; senao, tenta de novo na proxima hora.
+    if enviar "$MSG"; then
+      echo "vazio" > "$ESTADO"
+      echo "recuperado — aviso enviado"
+    else
+      echo "recuperado — mas o aviso NAO saiu; tenta de novo na proxima hora"
+    fi
     exit 0
   fi
   log "VIGIA-CNPJ | tudo certo: $texto"
@@ -135,8 +154,11 @@ _(aviso automatico do vigia-cnpj — ver /var/log/cnpj-vigia.log na VPS)_"
 
 if [ "$MODO" = "dry" ]; then echo "--- DRY-RUN ---"; echo "$MSG"; exit 0; fi
 
-body=$(python3 -c "import json,sys;print(json.dumps({'to':'$DEST','text':sys.stdin.read()}))" <<<"$MSG")
-curl -s -m 60 -X POST "$BRIDGE/send" -H 'Content-Type: application/json' --data "$body" >/dev/null 2>&1 \
-  && { log "VIGIA-CNPJ | alerta enviado"; echo "$assinatura" > "$ESTADO"; } \
-  || log "VIGIA-CNPJ | FALHOU ao enviar o alerta"
-echo "${#problemas[@]} problema(s) — alerta enviado"
+# A assinatura so e gravada se a mensagem saiu. Se a bridge estiver fora, o
+# alerta nao vira "ja avisado" e sai de verdade na proxima hora.
+if enviar "$MSG"; then
+  echo "$assinatura" > "$ESTADO"
+  echo "${#problemas[@]} problema(s) — alerta enviado"
+else
+  echo "${#problemas[@]} problema(s) — alerta NAO saiu; tenta de novo na proxima hora"
+fi
