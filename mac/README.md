@@ -78,6 +78,46 @@ para você conferir; apague na mão depois.
 
 Os dois arquivos do launchd não rotacionam — crescem devagar, mas crescem.
 
+## Avisos no WhatsApp
+
+Duas fontes, com responsabilidades separadas: **o coletor avisa o progresso, o
+vigia avisa os problemas.** Se os dois avisassem falha, o mesmo incidente
+renderia duas mensagens — e o vigia existe exatamente para o caso em que o Mac
+mini não consegue falar.
+
+O coletor manda três mensagens, e só no dia em que há mês novo:
+
+| Momento | Mensagem |
+|---|---|
+| Passo 3 confirma que há trabalho | 🆕 A Receita publicou AAAA-MM — N arquivos, X GB |
+| Passo 4 termina | ⬇️ Download concluído — X GB em N min |
+| Passo 9 cria o job | ✅ Entregue à VPS — o processamento leva ~4h |
+
+Nos outros ~29 dias do mês ele encerra em 6 segundos **sem dizer nada**. Aviso
+diário de "nada novo" viraria ruído e treinaria quem lê a ignorar a mensagem
+que importa.
+
+O primeiro aviso sai depois do passo 3, e não na detecção: a Receita serve o
+mesmo mês por semanas, então avisar na detecção mandaria a mesma mensagem todo
+dia. O que é novidade é *haver trabalho*, e quem responde isso é o `job_queue`
+da VPS.
+
+O `--ensaio` não avisa ninguém: é teste manual, e "A Receita publicou" seria
+alarme falso.
+
+Desligar temporariamente (a carga continua normal, só as mensagens param):
+
+```bash
+CNPJ_AVISAR=0 ./.venv/bin/python mac/coletor.py
+```
+
+**Teste nunca envia.** O `avisar` recusa enviar quando `PYTEST_CURRENT_TEST`
+está no ambiente. A trava existe porque em 21/09/2026 dois testes que chamam
+`coletar()` com os passos mockados esqueceram de mockar o `avisar`, e a suite
+disparou 8 mensagens para uma pessoa de verdade. Se a suite começar a demorar
+dezenas de segundos em vez de menos de um, é sinal de que algum teste voltou a
+fazer chamada real.
+
 ## Batimento e vigia
 
 O modo de falha mais provável deste desenho não produz erro nenhum: Mac mini
