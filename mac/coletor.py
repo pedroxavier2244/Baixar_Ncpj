@@ -535,6 +535,55 @@ def gravar_batimento(resultado: str, acao: str, detalhe: str,
         log.warning(f"nao consegui gravar o batimento na VPS: {exc}")
 
 
+def publicar_no_crm(resultado: str, acao: str, detalhe: str, run_key: str | None,
+                    duracao_min: float, inicio_iso: str) -> None:
+    """
+    Manda esta rodada para a aba Logs do CRM (POST /api/abertura/automacao-execucao).
+
+    POR QUE PASSA PELA VPS, e não por HTTPS daqui: a rota exige o token
+    AUTOMACAO_LOG_TOKEN, que já vive no `.env` da VPS. Mandando o `curl` pelo MESMO
+    canal SSH que o batimento usa, o segredo não precisa ser copiado para este Mac —
+    nem ficar num plist de LaunchDaemon. O destino é o crm-api em localhost:3002, que
+    é onde a rota mora (o nginx na frente só repete isso para fora).
+
+    O batimento continua existindo e NÃO é substituído: ele é o alarme do vigia
+    (detecta Mac mudo); isto aqui é a linha legível na tela do CRM. São públicos
+    diferentes, e um não pode depender do outro.
+
+    Nunca levanta: perder a linha do log não pode mascarar o resultado da execução.
+    """
+    payload = {
+        "automacao": "receita-cnpj",
+        "origem": "mac-mini",
+        "motivo": "agendado 22h",
+        "inicio": inicio_iso,
+        "fim": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        # 'nada_a_fazer' é sucesso, e não aviso: o mês já estar SUCCESS na VPS é o
+        # desfecho mais comum (o coletor roda todo dia e a RF publica uma vez por mês).
+        "status": "ok" if resultado == "ok" else "erro",
+        "resumo": f"{acao}: {detalhe}"[:2000],
+        "erro": detalhe[:4000] if resultado != "ok" else None,
+        "detalhe": {"run_key": run_key, "duracao_min": round(duracao_min, 1), "acao": acao},
+    }
+    # O token é lido NA VPS, do .env que o crm-api já usa. Nunca trafega como argumento
+    # (ficaria no `ps` de quem estiver na máquina): sai de uma variável do shell remoto.
+    remoto = (
+        "TOKEN=$(grep -m1 '^AUTOMACAO_LOG_TOKEN=' /opt/apps/mb-crm/.env | cut -d= -f2- | tr -d '\"'\"'\r\n') && "
+        "[ -n \"$TOKEN\" ] && "
+        "curl -sS -m 20 -o /dev/null -w '%{http_code}' "
+        "-X POST http://127.0.0.1:3002/api/abertura/automacao-execucao "
+        "-H 'Content-Type: application/json' -H \"x-automacao-token: $TOKEN\" --data-binary @-"
+    )
+    try:
+        codigo = _ssh(remoto, entrada=json.dumps(payload, ensure_ascii=False), timeout=60).strip()
+        if codigo.startswith("2"):
+            log.info(f"rodada publicada no CRM (HTTP {codigo})")
+        else:
+            log.warning(f"CRM recusou a rodada: HTTP {codigo}")
+    except Exception as exc:
+        log.warning(f"nao consegui publicar a rodada no CRM: {exc}")
+
+
 # ── Trava ─────────────────────────────────────────────────────────────────────
 
 @contextmanager
@@ -681,6 +730,8 @@ def main() -> int:
     args = parser.parse_args()
 
     inicio = time.monotonic()
+    # monotonic nao vira data: o CRM precisa do instante real em que a rodada comecou.
+    inicio_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
     log.info(f"=== coletor iniciado {datetime.now().isoformat(timespec='seconds')} "
              f"{'(ENSAIO)' if args.ensaio else ''}")
 
@@ -709,6 +760,7 @@ def main() -> int:
         # vigia aceitar como prova de vida algo que não prova que o daemon roda.
         if not args.ensaio:
             gravar_batimento(resultado, acao, detalhe, ctx.get("run_key"), duracao)
+            publicar_no_crm(resultado, acao, detalhe, ctx.get("run_key"), duracao, inicio_iso)
         log.info(f"=== coletor terminou em {duracao:.1f} min")
     return rc
 

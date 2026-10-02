@@ -608,3 +608,66 @@ def test_dia_sem_novidade_nao_avisa():
         with pytest.raises(c.NadaAFazer):
             c.coletar()
     avisar.assert_not_called()
+
+
+# ── Aba Logs do CRM ───────────────────────────────────────────────────────────
+# O batimento é alarme do vigia; isto aqui é a linha que a conta dev lê no CRM.
+# São públicos diferentes, e o envio passa pelo MESMO SSH do batimento de propósito:
+# assim o AUTOMACAO_LOG_TOKEN continua só no .env da VPS e não precisa ser copiado
+# para o Mac mini nem para o plist do LaunchDaemon.
+
+def test_publica_a_rodada_no_crm_com_o_contrato_da_rota():
+    c = _coletor()
+    with patch.object(c, "_ssh", return_value="200") as ssh:
+        c.publicar_no_crm("ok", "nada_a_fazer", "2026-09 ja esta SUCCESS na VPS",
+                          "2026-09", 0.3, "2026-10-02T01:00:00+00:00")
+        remoto, = ssh.call_args[0]
+        payload = json.loads(ssh.call_args[1]["entrada"])
+
+    # o id tem de ser o do CATALOGO do CRM, senao a rota responde 400
+    assert payload["automacao"] == "receita-cnpj"
+    assert payload["origem"] == "mac-mini"
+    assert payload["status"] == "ok"
+    assert payload["inicio"] == "2026-10-02T01:00:00+00:00"
+    assert "nada_a_fazer" in payload["resumo"]
+    assert payload["erro"] is None
+    assert payload["detalhe"]["run_key"] == "2026-09"
+    assert payload["detalhe"]["duracao_min"] == 0.3
+
+
+def test_token_e_lido_na_vps_e_nao_viaja_como_argumento():
+    """Token em argumento de comando aparece no `ps` de quem estiver na maquina."""
+    c = _coletor()
+    with patch.object(c, "_ssh", return_value="200") as ssh:
+        c.publicar_no_crm("ok", "nada_a_fazer", "x", "2026-09", 0.1, "2026-10-02T01:00:00+00:00")
+        remoto, = ssh.call_args[0]
+
+    assert "AUTOMACAO_LOG_TOKEN" in remoto and "/opt/apps/mb-crm/.env" in remoto
+    assert "$TOKEN" in remoto           # sai por variavel do shell remoto
+    assert "127.0.0.1:3002" in remoto   # o crm-api, nao o nginx
+
+
+def test_rodada_que_falhou_vai_como_erro():
+    c = _coletor()
+    with patch.object(c, "_ssh", return_value="200") as ssh:
+        c.publicar_no_crm("falha", "erro", "download_step falhou", "2026-10", 3.2,
+                          "2026-10-02T01:00:00+00:00")
+        payload = json.loads(ssh.call_args[1]["entrada"])
+    assert payload["status"] == "erro"
+    assert payload["erro"] == "download_step falhou"
+
+
+def test_crm_fora_do_ar_nao_derruba_a_execucao(caplog):
+    """Perder a linha do log e melhor que perder a rodada -- mesma regra do batimento."""
+    c = _coletor()
+    with patch.object(c, "_ssh", side_effect=c.ErroColetor("ssh falhou (rc=255)")):
+        c.publicar_no_crm("ok", "entregue", "2026-10 entregue", "2026-10", 31.4,
+                          "2026-10-02T01:00:00+00:00")
+    assert "nao consegui publicar" in caplog.text
+
+
+def test_crm_que_recusa_aparece_no_log(caplog):
+    c = _coletor()
+    with patch.object(c, "_ssh", return_value="401"):
+        c.publicar_no_crm("ok", "entregue", "x", "2026-10", 1.0, "2026-10-02T01:00:00+00:00")
+    assert "HTTP 401" in caplog.text
