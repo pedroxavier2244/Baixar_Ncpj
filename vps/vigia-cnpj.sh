@@ -64,10 +64,15 @@ enviar(){
 }
 
 problemas=()
+# Chave estavel de cada problema, paralela a problemas[]. E ela — nao o texto —
+# que entra na assinatura: o texto diz "ha 6h", "ha 7h"... e mudava a cada hora,
+# o que fez o mesmo incidente de 03/10/2026 render 21 mensagens iguais.
+chaves=()
 
 # 1) existe batimento?
 if [ ! -f "$BATIMENTO" ]; then
   problemas+=("nunca recebi batimento do Mac mini (arquivo nao existe)")
+  chaves+=("sem-arquivo")
 else
   # 2) o batimento e recente? E o que ele diz?
   leitura=$(python3 - "$BATIMENTO" "$MAX_HORAS" <<'PY'
@@ -78,7 +83,7 @@ caminho, max_horas = sys.argv[1], float(sys.argv[2])
 try:
     d = json.load(open(caminho, encoding="utf-8"))
 except Exception as exc:
-    print(f"ERRO|batimento ilegivel ({type(exc).__name__})")
+    print(f"ERRO|ilegivel|batimento ilegivel ({type(exc).__name__})")
     raise SystemExit(0)
 
 try:
@@ -87,33 +92,35 @@ try:
         ts = ts.replace(tzinfo=timezone.utc)
     horas = (datetime.now(timezone.utc) - ts).total_seconds() / 3600
 except Exception:
-    print("ERRO|batimento sem data utilizavel")
+    print("ERRO|sem-data|batimento sem data utilizavel")
     raise SystemExit(0)
 
 if horas > max_horas:
-    print(f"ERRO|sem batimento ha {horas:.0f}h (limite {max_horas:.0f}h) — "
+    print(f"ERRO|mudo@{d.get('ts')}|sem batimento ha {horas:.0f}h (limite {max_horas:.0f}h) — "
           f"ultimo em {d.get('ts')}, Mac mini desligado, sem rede ou daemon parado")
 elif d.get("resultado") != "ok":
-    print(f"ERRO|o coletor rodou e FALHOU: {d.get('detalhe')} "
+    print(f"ERRO|falha@{d.get('ts')}|o coletor rodou e FALHOU: {d.get('detalhe')} "
           f"(acao={d.get('acao')}, mes={d.get('run_key')}, ha {horas:.0f}h)")
 else:
-    print(f"OK|batimento de {horas:.0f}h atras: {d.get('acao')} "
+    print(f"OK||batimento de {horas:.0f}h atras: {d.get('acao')} "
           f"mes={d.get('run_key')} em {d.get('duracao_min')}min")
 PY
 )
-  estado="${leitura%%|*}"
-  texto="${leitura#*|}"
-  [ "$estado" = "ERRO" ] && problemas+=("$texto")
+  # formato: ESTADO|CHAVE|TEXTO — o texto vai por ultimo porque o detalhe do
+  # coletor pode conter "|"
+  estado="${leitura%%|*}"; resto="${leitura#*|}"
+  chave="${resto%%|*}";    texto="${resto#*|}"
+  if [ "$estado" = "ERRO" ]; then problemas+=("$texto"); chaves+=("$chave"); fi
 fi
 
 # 3) a bridge esta conectada? Sem ela, nada disso chega a ninguem.
 curl -s -m 10 "$BRIDGE/health" 2>/dev/null | grep -q conectado \
-  || problemas+=("a bridge do WhatsApp NAO esta conectada — alertas nao saem")
+  || { problemas+=("a bridge do WhatsApp NAO esta conectada — alertas nao saem"); chaves+=("bridge"); }
 
 # ── Deduplicacao ────────────────────────────────────────────────────────────
 # Roda de hora em hora; sem isto, um Mac mini desligado no fim de semana renderia
 # 48 mensagens iguais. Guarda a assinatura do problema e so fala quando ela muda.
-assinatura=$(printf '%s\n' "${problemas[@]:-}" | md5sum | cut -d' ' -f1)
+assinatura=$(printf '%s\n' "${chaves[@]:-}" | md5sum | cut -d' ' -f1)
 anterior=$(cat "$ESTADO" 2>/dev/null || echo "")
 
 if [ ${#problemas[@]} -eq 0 ]; then
