@@ -39,6 +39,7 @@ import argparse
 import fcntl
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -77,6 +78,9 @@ CONTAINER = os.environ.get("CNPJ_CONTAINER", "cnpj_worker")
 RSYNC = os.environ.get("CNPJ_RSYNC", "/opt/homebrew/bin/rsync")
 PARALELO = int(os.environ.get("CNPJ_PARALELO", "4"))
 TENTATIVAS_ENVIO = int(os.environ.get("CNPJ_TENTATIVAS_ENVIO", "3"))
+TENTATIVAS_SSH = int(os.environ.get("CNPJ_TENTATIVAS_SSH", "3"))
+PAUSA_SSH_S = int(os.environ.get("CNPJ_PAUSA_SSH_S", "15"))        # 15s, depois 30s
+SSH_CONNECT_TIMEOUT = int(os.environ.get("CNPJ_SSH_CONNECT_TIMEOUT", "30"))
 IDADE_MINIMA_H = float(os.environ.get("CNPJ_IDADE_MINIMA_H", "2"))
 LOCK_PATH = Path(os.environ.get("CNPJ_LOCK", str(Path.home() / "cnpj" / "coletor.lock")))
 
@@ -113,17 +117,51 @@ class NadaAFazer(Exception):
 
 # ── SSH ───────────────────────────────────────────────────────────────────────
 
+# Mensagens do cliente ssh que só existem ANTES da autenticação — o comando
+# remoto ainda não rodou, então tentar de novo é seguro. Queda no meio da sessão
+# ("Connection to X closed by remote host", "Timeout, server not responding")
+# fica de fora de propósito: ali o comando pode ter rodado, e renomear a pasta
+# ou criar o job duas vezes é pior que perder o dia.
+_FALHAS_DE_CONEXAO = re.compile(
+    r"port \d+ timed out"              # handshake travou (visto em 03/10/2026)
+    r"|connect to host .+:"            # TCP não abriu: timeout, refused, no route
+    r"|Could not resolve hostname"
+    r"|kex_exchange_identification"
+    r"|banner exchange"
+    r"|Connection (closed|reset) by \S+ port \d+"
+)
+
+
+def _falha_de_conexao(cp: subprocess.CompletedProcess) -> bool:
+    return cp.returncode == 255 and bool(_FALHAS_DE_CONEXAO.search(cp.stderr or ""))
+
+
 def _ssh(remoto: str, *, entrada: str | None = None, timeout: int = 300) -> str:
-    """Roda um comando na VPS e devolve o stdout. Levanta ErroColetor se falhar."""
-    cp = subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", SSH_ALIAS, remoto],
-        input=entrada, capture_output=True, text=True, timeout=timeout,
+    """
+    Roda um comando na VPS e devolve o stdout. Levanta ErroColetor se falhar.
+
+    Tenta de novo só quando a conexão nem chegou a abrir. Em 03/10/2026 um
+    handshake travou por ~40s e derrubou a execução do dia inteiro; 2s depois o
+    mesmo Mac conectou normal.
+    """
+    argv = ["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={SSH_CONNECT_TIMEOUT}",
+            SSH_ALIAS, remoto]
+    for tentativa in range(1, TENTATIVAS_SSH + 1):
+        cp = subprocess.run(argv, input=entrada, capture_output=True, text=True,
+                            timeout=timeout)
+        if cp.returncode == 0:
+            return cp.stdout
+        if not _falha_de_conexao(cp) or tentativa == TENTATIVAS_SSH:
+            break
+        espera = PAUSA_SSH_S * tentativa
+        log.warning(f"ssh nao conectou (tentativa {tentativa}/{TENTATIVAS_SSH}), "
+                    f"de novo em {espera}s: {cp.stderr.strip()}")
+        time.sleep(espera)
+
+    sufixo = f" — apos {TENTATIVAS_SSH} tentativas" if _falha_de_conexao(cp) else ""
+    raise ErroColetor(
+        f"ssh falhou (rc={cp.returncode}): {cp.stderr.strip() or cp.stdout.strip()}{sufixo}"
     )
-    if cp.returncode != 0:
-        raise ErroColetor(
-            f"ssh falhou (rc={cp.returncode}): {cp.stderr.strip() or cp.stdout.strip()}"
-        )
-    return cp.stdout
 
 
 def _cmd_container(*argv: str) -> str:

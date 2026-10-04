@@ -367,6 +367,99 @@ def test_destino_divergente_nao_cria_job():
         criar.assert_not_called()
 
 
+# ── SSH: nova tentativa só quando a conexão nem chegou a abrir ────────────────
+# Em 03/10/2026 um handshake travou por ~40s e derrubou a execução do dia; 2s
+# depois o mesmo Mac conectou normal. Mas repetir às cegas é perigoso: se o
+# comando chegou a rodar (renomear, --files-ready), rodar de novo duplica efeito.
+
+def _cp(rc: int, stderr: str = "", stdout: str = ""):
+    import subprocess
+    return subprocess.CompletedProcess(["ssh"], rc, stdout=stdout, stderr=stderr)
+
+
+_TIMEOUT_HANDSHAKE = "Connection to 5.189.163.33 port 22 timed out"
+
+
+def test_ssh_tenta_de_novo_quando_a_conexao_nao_abre():
+    c = _coletor()
+    respostas = [_cp(255, _TIMEOUT_HANDSHAKE), _cp(0, stdout="ok\n")]
+    with patch.object(c.subprocess, "run", side_effect=respostas) as run, \
+         patch.object(c.time, "sleep") as dorme:
+        assert c._ssh("true") == "ok\n"
+    assert run.call_count == 2
+    dorme.assert_called_once()
+
+
+def test_ssh_reenvia_o_stdin_na_nova_tentativa():
+    """O batimento e o aviso vão pelo stdin; a segunda tentativa precisa dele inteiro."""
+    c = _coletor()
+    respostas = [_cp(255, "kex_exchange_identification: Connection closed by remote host"),
+                 _cp(0)]
+    with patch.object(c.subprocess, "run", side_effect=respostas) as run, \
+         patch.object(c.time, "sleep"):
+        c._ssh("cat > x", entrada='{"a": 1}')
+    assert [ch.kwargs["input"] for ch in run.call_args_list] == ['{"a": 1}'] * 2
+
+
+@pytest.mark.parametrize("stderr", [
+    _TIMEOUT_HANDSHAKE,
+    "ssh: connect to host 5.189.163.33 port 22: Operation timed out",
+    "ssh: connect to host 5.189.163.33 port 22: Connection refused",
+    "ssh: connect to host 5.189.163.33 port 22: No route to host",
+    "ssh: Could not resolve hostname cnpj-vps: nodename nor servname provided",
+    "kex_exchange_identification: read: Connection reset by peer",
+    "Connection closed by 5.189.163.33 port 22",
+    "Connection timed out during banner exchange",
+])
+def test_ssh_reconhece_falha_de_conexao(stderr):
+    c = _coletor()
+    assert c._falha_de_conexao(_cp(255, stderr))
+
+
+@pytest.mark.parametrize("cp", [
+    # caiu no meio da sessão: o comando pode ter rodado
+    _cp(255, "Connection to 5.189.163.33 closed by remote host."),
+    _cp(255, "Timeout, server 5.189.163.33 not responding."),
+    # o próprio comando remoto falhou — repetir não muda nada
+    _cp(1, "mv: cannot stat '/x': No such file or directory"),
+    _cp(255, ""),
+])
+def test_ssh_nao_confunde_outras_falhas_com_conexao(cp):
+    c = _coletor()
+    assert not c._falha_de_conexao(cp)
+
+
+def test_ssh_nao_repete_queda_no_meio_da_sessao():
+    """Comando que pode ter rodado (renomear, criar job) não é executado duas vezes."""
+    c = _coletor()
+    with patch.object(c.subprocess, "run",
+                      return_value=_cp(255, "Connection to x closed by remote host.")) as run, \
+         patch.object(c.time, "sleep"):
+        with pytest.raises(c.ErroColetor, match="closed by remote host"):
+            c._ssh("criar job")
+    assert run.call_count == 1
+
+
+def test_ssh_desiste_depois_das_tentativas():
+    c = _coletor()
+    with patch.object(c.subprocess, "run", return_value=_cp(255, _TIMEOUT_HANDSHAKE)) as run, \
+         patch.object(c.time, "sleep"):
+        with pytest.raises(c.ErroColetor, match="timed out") as erro:
+            c._ssh("true")
+    assert run.call_count == c.TENTATIVAS_SSH
+    # a mensagem que vai para o batimento diz que já houve insistência
+    assert f"{c.TENTATIVAS_SSH} tentativas" in str(erro.value)
+
+
+def test_ssh_passa_connect_timeout():
+    """Sem prazo explícito, o tempo de desistir fica a cargo do ~/.ssh/config do Mac."""
+    c = _coletor()
+    with patch.object(c.subprocess, "run", return_value=_cp(0)) as run:
+        c._ssh("true")
+    argv = run.call_args[0][0]
+    assert any(a.startswith("ConnectTimeout=") for a in argv)
+
+
 # ── Batimento ─────────────────────────────────────────────────────────────────
 # O batimento é a única defesa contra a falha que não produz erro nenhum: Mac
 # mini desligado, sem rede ou com o daemon parado não geram log em lugar algum.

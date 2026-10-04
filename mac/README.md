@@ -196,6 +196,8 @@ máquina.
 | `foi publicado ha X h, menos que 2h` | Guarda proposital: a Receita pode estar no meio da publicação |
 | `esta DEAD — nao vou mexer` | O job esgotou as 3 tentativas na VPS. Pede intervenção manual; os ZIPs locais ficam para reenvio |
 | `ja existe na VPS e nao bate com o manifest` | `/data/<mes>` já existe lá com conteúdo divergente. Conferir na mão antes de rodar de novo |
+| `ssh falhou ... apos 3 tentativas` | A conexão com a VPS não abriu em nenhuma das 3 tentativas (~2 min). Rede do escritório fora, ou SSH da VPS sobrecarregado. Quedas curtas, como a de 03/10/2026, já são absorvidas pelas novas tentativas |
+| `ssh falhou` sem "tentativas" | Caiu no meio da sessão, ou o comando remoto falhou. Isso **não** é repetido de propósito: o comando pode ter rodado e renomear ou criar job duas vezes é pior que perder o dia |
 | Nada nos logs às 22h | Máquina desligada, dormindo, ou plist não carregado. `sudo launchctl print system/br.com.mbfinance.cnpj-coletor` |
 
 Hoje **não existe aviso de falha**: se este Mac mini estiver desligado ou sem
