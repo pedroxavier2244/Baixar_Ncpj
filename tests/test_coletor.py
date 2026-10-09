@@ -647,6 +647,57 @@ def test_token_e_lido_na_vps_e_nao_viaja_como_argumento():
     assert "127.0.0.1:3002" in remoto   # o crm-api, nao o nginx
 
 
+@pytest.mark.parametrize("linha_env", [
+    'AUTOMACAO_LOG_TOKEN=abc123\n',
+    'AUTOMACAO_LOG_TOKEN="abc123"\r\n',   # .env salvo no Windows, com aspas
+    "AUTOMACAO_LOG_TOKEN='abc123'\n",
+])
+def test_comando_do_crm_roda_no_bash_e_extrai_o_token_limpo(tmp_path, linha_env):
+    """
+    Executa o comando remoto de verdade, com .env e curl falsos. De 02/10 a
+    09/10/2026 o \\r\\n do `tr` era CR/LF de verdade na string e o bash da VPS
+    morria com "unexpected EOF" — os asserts de substring acima não pegaram.
+    """
+    import shutil
+    import subprocess
+
+    bash = shutil.which("bash")
+    if not bash:
+        pytest.skip("bash ausente")
+
+    env_file = tmp_path / ".env"
+    env_file.write_text("OUTRA=1\n" + linha_env, encoding="utf-8")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    curl = bin_dir / "curl"
+    # O curl falso grava os argumentos e o corpo, e responde como o crm-api.
+    curl.write_text(
+        '#!/bin/sh\n'
+        f'printf "%s\\n" "$@" > {tmp_path}/args\n'
+        f'cat > {tmp_path}/corpo\n'
+        'printf 201\n'
+    )
+    curl.chmod(0o755)
+
+    c = _coletor()
+    with patch.object(c, "_ssh", return_value="201") as ssh:
+        c.publicar_no_crm("ok", "nada_a_fazer", "x", "2026-09", 0.1, "2026-10-02T01:00:00+00:00")
+        remoto, = ssh.call_args[0]
+        entrada = ssh.call_args[1]["entrada"]
+
+    remoto = remoto.replace("/opt/apps/mb-crm/.env", str(env_file))
+    cp = subprocess.run(
+        [bash, "-c", remoto], input=entrada, capture_output=True, text=True,
+        env={"PATH": f"{bin_dir}:/usr/bin:/bin"}, timeout=10,
+    )
+
+    assert cp.returncode == 0, cp.stderr
+    assert cp.stdout == "201"
+    args = (tmp_path / "args").read_text().splitlines()
+    assert "x-automacao-token: abc123" in args
+    assert json.loads((tmp_path / "corpo").read_text())["automacao"] == "receita-cnpj"
+
+
 def test_rodada_que_falhou_vai_como_erro():
     c = _coletor()
     with patch.object(c, "_ssh", return_value="200") as ssh:

@@ -568,7 +568,9 @@ def publicar_no_crm(resultado: str, acao: str, detalhe: str, run_key: str | None
     # O token é lido NA VPS, do .env que o crm-api já usa. Nunca trafega como argumento
     # (ficaria no `ps` de quem estiver na máquina): sai de uma variável do shell remoto.
     remoto = (
-        "TOKEN=$(grep -m1 '^AUTOMACAO_LOG_TOKEN=' /opt/apps/mb-crm/.env | cut -d= -f2- | tr -d '\"'\"'\r\n') && "
+        # Raw string de propósito: sem o r, o \r\n viraria CR/LF de verdade no
+        # comando e o bash remoto morria com "unexpected EOF" (02/10 a 09/10/2026).
+        r"""TOKEN=$(grep -m1 '^AUTOMACAO_LOG_TOKEN=' /opt/apps/mb-crm/.env | cut -d= -f2- | tr -d "\"'\r\n") && """
         "[ -n \"$TOKEN\" ] && "
         "curl -sS -m 20 -o /dev/null -w '%{http_code}' "
         "-X POST http://127.0.0.1:3002/api/abertura/automacao-execucao "
