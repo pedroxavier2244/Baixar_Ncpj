@@ -5,7 +5,7 @@ Para cada tabela principal (empresas, estabelecimentos, socios, simples):
   1. DROP TABLE <nome>_old CASCADE  (tabelas antigas do run anterior + deps obsoletas do MV)
   2. CREATE TABLE <nome>_new        (mesma DDL, com run_key/created_at como DEFAULT)
   3. COPY CSV direto para <nome>_new (sem índices ainda = máxima velocidade)
-  4. CREATE INDEX em <nome>_new     (após carga = muito mais rápido)
+  4. SET LOGGED + CREATE INDEX em <nome>_new (a _new nasce UNLOGGED só para o COPY)
   5. Swap atômico (milissegundos):
        ALTER TABLE <nome>     RENAME TO <nome>_old
        ALTER TABLE <nome>_new RENAME TO <nome>
@@ -285,6 +285,27 @@ def _dedup_in_place(
     return max(0, removed or 0)
 
 
+def _set_logged(conn: psycopg.Connection, new_table: str) -> None:
+    """
+    Converte a _new para LOGGED antes de ela virar a tabela viva.
+
+    A _new nasce UNLOGGED porque o COPY sem WAL é muito mais rápido. Mas o swap
+    só renomeia: sem isto, a tabela viva herda o UNLOGGED, e o Postgres esvazia
+    toda tabela UNLOGGED depois de um desligamento não limpo. Foi o que
+    aconteceu no reinício de 06/10/2026: rf_empresas, rf_estabelecimentos,
+    rf_simples e rf_socios amanheceram vazias. A API seguiu respondendo pelo MV,
+    e só se notou porque os sócios sumiram do CRM.
+
+    Roda depois do dedup (a reescrita já descarta as tuplas mortas do DELETE) e
+    antes da PK e dos índices (que assim nascem logados, sem serem refeitos).
+    Custa WAL do tamanho da tabela — é o preço de o dado sobreviver a reinício.
+    """
+    log.info(f"  {new_table}: SET LOGGED (grava WAL — pode levar alguns minutos)")
+    with conn.cursor() as cur:
+        cur.execute(f"ALTER TABLE {new_table} SET LOGGED")
+    conn.commit()
+
+
 def _build_new_table(
     conn: psycopg.Connection,
     new_table: str,
@@ -317,10 +338,14 @@ def _build_new_table(
     conn.commit()
     log.info(f"  {new_table}: ~{count:,} rows loaded")
 
-    # Dedup pela chave natural + ADD PRIMARY KEY (antes dos índices secundários).
     if pk_cols:
         data_cols = [c for c in columns if c not in pk_cols]
         _dedup_in_place(conn, new_table, pk_cols, data_cols)
+
+    _set_logged(conn, new_table)
+
+    # ADD PRIMARY KEY antes dos índices secundários.
+    if pk_cols:
         key_list = ", ".join(pk_cols)
         with conn.cursor() as cur:
             cur.execute(f"ALTER TABLE {new_table} ADD PRIMARY KEY ({key_list})")

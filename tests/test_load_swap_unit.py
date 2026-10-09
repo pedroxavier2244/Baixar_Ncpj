@@ -418,6 +418,41 @@ def test_build_new_table_no_pk_when_pk_cols_omitted(tmp_path: Path):
     assert "ROW_NUMBER()" not in sqls
 
 
+@pytest.mark.parametrize("pk_cols", [["cnpj_basico"], None])
+def test_build_new_table_sets_logged_before_pk_and_indexes(tmp_path: Path, pk_cols):
+    """
+    A _new nasce UNLOGGED e o swap só renomeia: sem SET LOGGED a tabela viva
+    fica UNLOGGED e some no próximo reinício não limpo do Postgres (06/10/2026).
+    O SET LOGGED vem depois do COPY/dedup e antes da PK e dos índices.
+    """
+    csv_path = tmp_path / "test.csv"
+    csv_path.write_text("cnpj_basico\n00000001\n", encoding="utf-8")
+
+    conn = FakeConn()
+    with patch("steps.load_step._copy_csv", return_value=1):
+        _build_new_table(
+            conn,
+            new_table="cnpj.rf_empresas_new",
+            create_ddl="CREATE UNLOGGED TABLE cnpj.rf_empresas_new (cnpj_basico CHAR(8))",
+            csv_path=csv_path,
+            columns=["cnpj_basico"],
+            index_sqls=["CREATE INDEX idx_x ON cnpj.rf_empresas_new (cnpj_basico)"],
+            pk_cols=pk_cols,
+        )
+
+    sqls = [s.upper() for s, _ in conn.executed]
+    logged = [i for i, s in enumerate(sqls) if "ALTER TABLE CNPJ.RF_EMPRESAS_NEW SET LOGGED" in s]
+    assert len(logged) == 1, f"esperava um SET LOGGED, achei: {sqls}"
+
+    create_pos = next(i for i, s in enumerate(sqls) if s.startswith("CREATE UNLOGGED TABLE"))
+    idx_pos = next(i for i, s in enumerate(sqls) if s.startswith("CREATE INDEX"))
+    assert create_pos < logged[0] < idx_pos
+    if pk_cols:
+        pk_pos = next(i for i, s in enumerate(sqls) if "ADD PRIMARY KEY" in s)
+        dedup_pos = next(i for i, s in enumerate(sqls) if "ROW_NUMBER()" in s)
+        assert dedup_pos < logged[0] < pk_pos
+
+
 # ── run() tests ──────────────────────────────────────────────────────────────
 
 def _write_transform_manifest(checkpoint_dir: Path, out_dir: Path) -> None:
