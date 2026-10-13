@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import xml.etree.ElementTree as ET
@@ -48,6 +49,76 @@ PROPFIND_BODY = """<?xml version="1.0"?>
     <d:getetag/>
   </d:prop>
 </d:propfind>"""
+
+
+class RespostaNaoXML(Exception):
+    """A Receita respondeu algo que não é a listagem XML esperada.
+
+    POR QUE EXISTE (13/10/2026): na madrugada de 12/10 o coletor morreu com
+    `RetryError[<Future at 0x105... state=finished raised ParseError>]` — mensagem que
+    chega no WhatsApp e no cartão do CRM sem dizer NADA: nem o host, nem o status HTTP,
+    nem o que veio no lugar do XML. O corpo era descartado antes de alguém poder olhar, e
+    no dia seguinte o servidor já estava bom — ou seja, a evidência tinha sumido.
+
+    Isso importa agora porque a Receita publica a base no MEIO DO MÊS (a de setembro
+    entrou em 16/09). Uma página de erro devolvida justamente na noite da publicação
+    atrasaria o mês inteiro com uma mensagem que não ajuda ninguém a agir.
+
+    É erro RETENTÁVEL de propósito: resposta não-XML quase sempre é soluço do servidor.
+    """
+
+
+# Onde fica a amostra do corpo que não era XML. Fica FORA do log normal (que rotaciona por
+# dia e é lido no celular) e no mesmo lugar dos outros registros do coletor.
+AMOSTRA_DIR = Path.home() / "cnpj" / "logs"
+
+
+def _guardar_amostra(texto: str, status: int, url: str) -> Path | None:
+    """Guarda o corpo inteiro para quem for investigar depois. Nunca levanta."""
+    try:
+        AMOSTRA_DIR.mkdir(parents=True, exist_ok=True)
+        # Carimbo COM sufixo aleatório: as 3 tentativas do tenacity caem no mesmo segundo --
+        # e, num erro imediato, no mesmo milissegundo. Sem o sufixo a última sobrescrevia as
+        # anteriores, justo quando ter as três é o que mostra se o servidor variou ou repetiu
+        # o mesmo erro. Medido ao escrever o teste: 3 tentativas viravam 2 arquivos.
+        carimbo = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
+        destino = AMOSTRA_DIR / f"propfind-nao-xml-{carimbo}-{os.urandom(2).hex()}.txt"
+        destino.write_text(
+            f"url: {url}\nstatus: {status}\nquando: {datetime.now().isoformat()}\n\n{texto}",
+            encoding="utf-8",
+        )
+        return destino
+    except Exception:
+        return None
+
+
+def _listagem_de(resp: "httpx.Response", url: str) -> "ET.Element":
+    """O XML da LISTAGEM, ou um erro que diz o que veio no lugar dele."""
+    def recusar(porque: str, causa: Exception | None = None) -> "RespostaNaoXML":
+        amostra = _guardar_amostra(resp.text, resp.status_code, url)
+        inicio = " ".join((resp.text or "").split())[:200]
+        erro = RespostaNaoXML(
+            f"{httpx.URL(url).host} respondeu HTTP {resp.status_code} "
+            f"({resp.headers.get('content-type', 'sem content-type')}), "
+            f"{len(resp.text or '')} bytes, mas {porque}. "
+            f"Começo do que veio: {inicio!r}"
+            + (f". Corpo inteiro em {amostra}" if amostra else "")
+        )
+        return erro.with_traceback(causa.__traceback__) if causa else erro
+
+    try:
+        raiz = ET.fromstring(resp.text)
+    except ET.ParseError as e:
+        raise recusar(f"o corpo não é XML: {e}", e) from e
+
+    # NÃO basta ser XML. Uma página de erro bem-formada (`<html><head>...`) atravessa o
+    # parser inteiro e viraria "nenhum mês publicado" EM SILÊNCIO -- medido em 13/10/2026
+    # com uma pagina "502 Bad Gateway" de exemplo, que o ET.fromstring aceitou sem
+    # reclamar. O que a listagem precisa ter e a raiz `multistatus` do DAV.
+    if raiz.tag != "{DAV:}multistatus":
+        raise recusar(f"a raiz do XML é <{raiz.tag}>, e não a <d:multistatus> da listagem")
+
+    return raiz
 
 
 def _webdav_auth_candidates(token: str) -> list[tuple[str, str]]:
@@ -85,7 +156,7 @@ def propfind_listing(token: str, rel_path: str = "") -> list[dict]:
             raise last_error
         raise RuntimeError("WebDAV PROPFIND failed without response")
 
-    root = ET.fromstring(r.text)
+    root = _listagem_de(r, url)
     ns = {"d": "DAV:"}
     items = []
     prefix = webdav_href_prefix(token)
