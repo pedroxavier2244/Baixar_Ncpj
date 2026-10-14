@@ -2,17 +2,23 @@
 Index step — recria o MV (se necessário) e faz REFRESH, depois remove _old tables.
 
 Fluxo após o swap do load_step:
+  0. As fontes obrigatórias (rf_estabelecimentos, rf_empresas) têm dado? Se não,
+     FALHA SEM TOCAR NA MV — ela pode ser a única cópia do dado que ainda serve
+     a API (incidente de 14/10/2026, explicado no run()).
   1. Se mv_cnpj_full não existe (foi dropado por CASCADE junto com _old do run anterior):
        CREATE MATERIALIZED VIEW ... WITH NO DATA
        REFRESH MATERIALIZED VIEW  (full rebuild, não-concorrente)
   2. Se mv_cnpj_full existe mas não está populado (primeira carga):
        REFRESH MATERIALIZED VIEW  (full rebuild, não-concorrente)
-  3. Se mv_cnpj_full existe e está populado:
+  3. Se a definição da MV ficou presa nas _old (o swap é RENAME, e a MV segue o
+     OID): rebuild num nome ao lado + troca de nomes no fim, para não deixar a
+     API sem MV durante as ~3h de construção.
+  4. Se mv_cnpj_full existe, está populado e aponta para as tabelas certas:
        REFRESH MATERIALIZED VIEW CONCURRENTLY  (não bloqueia leitores)
 
-  Após o REFRESH:
-  4. DROP TABLE ... _old  (agora seguro: MV tem deps frescas nas tabelas novas)
-  5. Limpa cache Redis (se configurado)
+  Depois, em qualquer caminho:
+  5. DROP TABLE ... _old  (agora seguro: MV tem deps frescas nas tabelas novas)
+  6. Limpa cache Redis (se configurado)
 """
 from __future__ import annotations
 
@@ -40,8 +46,10 @@ _MAIN_TABLES = [
 ]
 
 # ── DDL do MV (espelho do db/schema.sql — mantido em sync manualmente) ──────
-_MV_DDL = f"""
-CREATE MATERIALIZED VIEW {_V}.mv_cnpj_full AS
+# Só o SELECT: o nome do alvo entra na hora. A MV é construída ora no nome
+# definitivo (quando não há nada servindo), ora num nome ao lado, para a troca
+# não tirar do ar a cópia que a API está usando (ver _rebuild_ao_lado).
+_MV_SELECT = f"""
 SELECT
     e.cnpj_basico || est.cnpj_ordem || est.cnpj_dv   AS cnpj_completo,
     e.cnpj_basico,
@@ -100,43 +108,55 @@ LEFT JOIN {_D}.rf_naturezas     nat  ON nat.codigo       = e.natureza_juridica
 LEFT JOIN {_D}.rf_motivos       mot  ON mot.codigo       = est.motivo_situacao_cadastral
 LEFT JOIN {_D}.rf_portes        prt  ON prt.codigo       = e.porte
 LEFT JOIN {_D}.rf_simples       sim  ON sim.cnpj_basico  = e.cnpj_basico
-WITH NO DATA
 """
 
-_MV_INDEXES = [
-    f"CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_cnpj_completo "
-    f"ON {_V}.mv_cnpj_full (cnpj_completo)",
-
-    f"CREATE INDEX IF NOT EXISTS idx_mv_cnpj_basico "
-    f"ON {_V}.mv_cnpj_full (cnpj_basico)",
-
-    f"CREATE INDEX IF NOT EXISTS idx_mv_razao_social_trgm "
-    f"ON {_V}.mv_cnpj_full USING gin (razao_social gin_trgm_ops)",
-
-    f"CREATE INDEX IF NOT EXISTS idx_mv_nome_fantasia_trgm "
-    f"ON {_V}.mv_cnpj_full USING gin (nome_fantasia gin_trgm_ops)",
-
-    f"CREATE INDEX IF NOT EXISTS idx_mv_municipio "
-    f"ON {_V}.mv_cnpj_full (municipio)",
-
-    f"CREATE INDEX IF NOT EXISTS idx_mv_uf "
-    f"ON {_V}.mv_cnpj_full (uf)",
-
-    f"CREATE INDEX IF NOT EXISTS idx_mv_cnae_fiscal "
-    f"ON {_V}.mv_cnpj_full (cnae_fiscal)",
-
-    f"CREATE INDEX IF NOT EXISTS idx_mv_situacao_cadastral "
-    f"ON {_V}.mv_cnpj_full (situacao_cadastral)",
-
-    f"CREATE INDEX IF NOT EXISTS idx_mv_opcao_simples "
-    f"ON {_V}.mv_cnpj_full (opcao_pelo_simples)",
-
-    f"CREATE INDEX IF NOT EXISTS idx_mv_opcao_mei "
-    f"ON {_V}.mv_cnpj_full (opcao_pelo_mei)",
-
-    f"CREATE INDEX IF NOT EXISTS idx_mv_municipio_descricao_trgm "
-    f"ON {_V}.mv_cnpj_full USING gin (municipio_descricao gin_trgm_ops)",
+# As duas tabelas que entram por JOIN (não LEFT JOIN): qualquer uma vazia zera a
+# MV inteira. As de domínio (cnaes, municípios...) são LEFT JOIN — ficaram com 0
+# linhas por meses sem que isso tirasse uma linha da MV.
+_FONTES_OBRIGATORIAS = [
+    f"{_D}.rf_estabelecimentos",
+    f"{_D}.rf_empresas",
 ]
+
+_MV = f"{_V}.mv_cnpj_full"
+_MV_NOVA = f"{_V}.mv_cnpj_full_novo"
+_SUF = "_novo"
+
+
+def _ddl_mv(alvo: str, com_dado: bool) -> str:
+    return (
+        f"CREATE MATERIALIZED VIEW {alvo} AS {_MV_SELECT}"
+        + ("" if com_dado else "\nWITH NO DATA")
+    )
+
+
+# (nome, único?, corpo) — o nome é renomeado na troca, então não pode ficar
+# grudado no SQL.
+_MV_INDEXES_SPEC = [
+    ("idx_mv_cnpj_completo", True, "(cnpj_completo)"),
+    ("idx_mv_cnpj_basico", False, "(cnpj_basico)"),
+    ("idx_mv_razao_social_trgm", False, "USING gin (razao_social gin_trgm_ops)"),
+    ("idx_mv_nome_fantasia_trgm", False, "USING gin (nome_fantasia gin_trgm_ops)"),
+    ("idx_mv_municipio", False, "(municipio)"),
+    ("idx_mv_uf", False, "(uf)"),
+    ("idx_mv_cnae_fiscal", False, "(cnae_fiscal)"),
+    ("idx_mv_situacao_cadastral", False, "(situacao_cadastral)"),
+    ("idx_mv_opcao_simples", False, "(opcao_pelo_simples)"),
+    ("idx_mv_opcao_mei", False, "(opcao_pelo_mei)"),
+    ("idx_mv_municipio_descricao_trgm", False, "USING gin (municipio_descricao gin_trgm_ops)"),
+]
+
+
+def _sql_indices(alvo: str, sufixo: str = "") -> list[str]:
+    return [
+        f"CREATE {'UNIQUE ' if uniq else ''}INDEX IF NOT EXISTS {nome}{sufixo} "
+        f"ON {alvo} {corpo}"
+        for nome, uniq, corpo in _MV_INDEXES_SPEC
+    ]
+
+
+_MV_DDL = _ddl_mv(_MV, com_dado=False)
+_MV_INDEXES = _sql_indices(_MV)
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -152,6 +172,39 @@ def _mv_status(conn: psycopg.Connection) -> str:
     return "populated" if row[0] else "empty"
 
 
+def _tem_linha(conn: psycopg.Connection, rel: str) -> bool:
+    """
+    Tem pelo menos uma linha? É EXISTS, não COUNT: com 70 milhões de linhas o
+    COUNT desta MV levou 22 MINUTOS em 14/10/2026 (06:20 -> 06:42 no log do
+    worker), e aqui a pergunta é só "tem dado ou não".
+    """
+    row = conn.execute(f"SELECT EXISTS (SELECT 1 FROM {rel} LIMIT 1)").fetchone()
+    return bool(row and row[0])
+
+
+def _fontes_vazias(conn: psycopg.Connection) -> list[str]:
+    """Quais das fontes obrigatórias da MV estão vazias."""
+    return [t for t in _FONTES_OBRIGATORIAS if not _tem_linha(conn, t)]
+
+
+def _aponta_para_old(conn: psycopg.Connection) -> bool:
+    """
+    A definição da MV está presa às tabelas _old?
+
+    A MV guarda a fonte por OID, não por nome. O swap do load_step é
+    `ALTER TABLE ... RENAME`, que preserva o OID — então renomear
+    rf_empresas -> rf_empresas_old ARRASTA a definição da MV junto, e um
+    REFRESH passa a ler as _old em vez das tabelas recém-carregadas. Dá para
+    ver em pg_matviews.definition: `FROM cnpj.rf_estabelecimentos_old est
+    JOIN cnpj.rf_empresas_old e ...`.
+    """
+    row = conn.execute(
+        "SELECT definition FROM pg_matviews "
+        f"WHERE schemaname = '{_V}' AND matviewname = 'mv_cnpj_full'"
+    ).fetchone()
+    return bool(row and row[0] and "_old" in row[0])
+
+
 def _recreate_mv(conn: psycopg.Connection) -> None:
     """Recria mv_cnpj_full do zero (após DROP por CASCADE ou primeira instalação)."""
     log.info("recreating mv_cnpj_full...")
@@ -159,6 +212,45 @@ def _recreate_mv(conn: psycopg.Connection) -> None:
     for idx_sql in _MV_INDEXES:
         conn.execute(idx_sql)
     log.info("mv_cnpj_full recreated (WITH NO DATA — REFRESH a seguir)")
+
+
+def _rebuild_ao_lado(conn: psycopg.Connection) -> None:
+    """
+    Reconstrói a MV num nome ao lado e troca os nomes no fim.
+
+    É o caminho de quando a definição ficou presa nas _old: um REFRESH leria a
+    tabela errada, e o DROP + CREATE direto deixaria a API sem MV durante a
+    construção inteira — que em 14/10/2026 levou 2h46 (03:34 -> 06:20), ou seja,
+    entraria no horário comercial.
+
+    A nova nasce WITH DATA. A viva só sai do ar na troca de nomes, que é uma
+    transação de milissegundos, e só DEPOIS de a nova estar conferida com dado:
+    trocar por uma MV vazia é o pior resultado possível, pior que não trocar.
+    """
+    log.info(f"construindo {_MV_NOVA} ao lado (a MV viva continua servindo)...")
+    conn.execute(f"DROP MATERIALIZED VIEW IF EXISTS {_MV_NOVA}")
+    conn.execute(_ddl_mv(_MV_NOVA, com_dado=True))
+    for idx_sql in _sql_indices(_MV_NOVA, _SUF):
+        conn.execute(idx_sql)
+
+    if not _tem_linha(conn, _MV_NOVA):
+        conn.execute(f"DROP MATERIALIZED VIEW IF EXISTS {_MV_NOVA}")
+        raise RuntimeError(
+            f"{_MV_NOVA} saiu vazia — troca NAO feita, a MV que esta servindo "
+            "ficou intacta"
+        )
+
+    log.info("trocando os nomes (transacao curta)...")
+    with conn.transaction():
+        # O DROP primeiro libera os nomes dos índices, que são únicos por schema.
+        conn.execute(f"DROP MATERIALIZED VIEW IF EXISTS {_MV}")
+        conn.execute(f"ALTER MATERIALIZED VIEW {_MV_NOVA} RENAME TO mv_cnpj_full")
+        for nome, _uniq, _corpo in _MV_INDEXES_SPEC:
+            # Sem isto o unique index volta chamado idx_mv_cnpj_completo_novo, e o
+            # REFRESH CONCURRENTLY do mês seguinte — que EXIGE um unique index —
+            # falharia sem relação aparente com este rebuild.
+            conn.execute(f"ALTER INDEX {_V}.{nome}{_SUF} RENAME TO {nome}")
+    log.info("mv_cnpj_full trocada pela nova, apontando para as tabelas atuais")
 
 
 def _drop_old_tables(conn: psycopg.Connection) -> None:
@@ -235,6 +327,27 @@ def run(job_id: str, run_key: str, checkpoint_dir: Path) -> StepResult:
             status = _mv_status(conn)
             log.info(f"mv_cnpj_full status: {status}")
 
+            # ANTES DE QUALQUER REFRESH: a fonte tem dado?
+            #
+            # O REFRESH é o ato destrutivo — ele substitui o conteúdo da MV. A
+            # conferência de linhas que existe no fim deste passo acusa o
+            # estrago, não impede: em 14/10/2026 ela falhou três vezes
+            # (03:34, 07:42, 08:47) com a API já respondendo "não encontrado"
+            # para qualquer CNPJ desde o primeiro refresh.
+            #
+            # E a MV pode ser a ÚNICA cópia do dado: as rf_* são UNLOGGED, e um
+            # reinício sujo do Postgres as esvazia sem tocar na MV (06/10/2026).
+            # Foi essa a combinação: tabelas vazias desde o dia 6, a MV ainda
+            # servindo, e o refresh da carga mensal apagou a última cópia.
+            vazias = _fontes_vazias(conn)
+            if vazias:
+                return StepResult.failed(
+                    "fontes obrigatorias da mv_cnpj_full vazias: "
+                    + ", ".join(vazias)
+                    + " — a MV foi preservada (segue servindo o dado anterior); "
+                    "verifique o load step"
+                )
+
             if status == "missing":
                 # MV foi dropada pelo CASCADE no load_step (dep em tabela _old)
                 # ou é a primeira execução após setup.py sem schema.sql aplicado
@@ -248,6 +361,17 @@ def run(job_id: str, run_key: str, checkpoint_dir: Path) -> StepResult:
                 _apply_session_settings(conn)
                 log.info("first-ever refresh of mv_cnpj_full (non-concurrent)...")
                 conn.execute(f"REFRESH MATERIALIZED VIEW {_V}.mv_cnpj_full")
+
+            elif _aponta_para_old(conn):
+                # O swap por rename arrastou a definição para as _old: um
+                # REFRESH leria a tabela errada (e as _old o load_step esvazia /
+                # dropa). Reconstrói ao lado e troca no fim.
+                _apply_session_settings(conn)
+                log.warning(
+                    "a definicao da MV aponta para as tabelas _old (swap por "
+                    "rename) — rebuild ao lado em vez de REFRESH"
+                )
+                _rebuild_ao_lado(conn)
 
             else:
                 # Atualização normal — aplica settings de sessão e verifica disco
